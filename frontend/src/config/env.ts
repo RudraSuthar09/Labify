@@ -10,31 +10,46 @@
 /** Supported OCR backends. Extend as providers are added. */
 export type OcrProvider = 'mock' | 'google-vision' | 'aws-textract';
 
+/**
+ * Sentinel used when API_BASE_URL is absent. It is intentionally NOT a real URL
+ * so any accidental request fails fast; callers should check `apiConfigured`
+ * first and surface a helpful message to the user instead of firing a request.
+ */
+export const UNCONFIGURED_API_BASE_URL = 'https://api-base-url-not-configured.invalid';
+
 const DEFAULTS = {
-  API_BASE_URL: 'https://api.example.com',
   OCR_PROVIDER: 'mock' as OcrProvider,
 };
 
-/**
- * Reads a variable from `process.env`, falling back to a default and warning
- * (in dev) when the variable is absent.
- */
-function read(name: 'API_BASE_URL' | 'OCR_PROVIDER', fallback: string): string {
-  const value = process.env[name];
-  if (value === undefined || value === '') {
-    if (__DEV__) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[env] "${name}" is not set — falling back to "${fallback}". ` +
-          `Add it to your .env file (see .env.example).`,
-      );
-    }
-    return fallback;
-  }
-  return value;
+/** Normalises an inlined env value: `undefined` or empty string → `undefined`. */
+function clean(value: string | undefined): string | undefined {
+  return value === undefined || value === '' ? undefined : value;
 }
 
-const rawOcrProvider = read('OCR_PROVIDER', DEFAULTS.OCR_PROVIDER);
+// IMPORTANT: these must be *static* `process.env.<NAME>` member accesses.
+// react-native-dotenv inlines them at build time; a dynamic `process.env[name]`
+// is NOT replaced by the babel plugin and would be `undefined` on the device.
+
+// --- API base URL ----------------------------------------------------------
+
+const rawApiBaseUrl = clean(process.env.API_BASE_URL);
+const apiConfigured = rawApiBaseUrl !== undefined;
+
+if (!apiConfigured && __DEV__) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[env] API_BASE_URL is not set — the app cannot reach the backend. ' +
+      'Add it to your .env file (see .env.example). Verification will show a ' +
+      'configuration error until this is fixed.',
+  );
+}
+
+// Normalise: strip any trailing slashes so we can safely append paths.
+const apiBaseUrl = (rawApiBaseUrl ?? UNCONFIGURED_API_BASE_URL).replace(/\/+$/, '');
+
+// --- OCR provider (informational) ------------------------------------------
+
+const rawOcrProvider = clean(process.env.OCR_PROVIDER) ?? DEFAULTS.OCR_PROVIDER;
 const VALID_PROVIDERS: OcrProvider[] = ['mock', 'google-vision', 'aws-textract'];
 if (__DEV__ && !VALID_PROVIDERS.includes(rawOcrProvider as OcrProvider)) {
   // eslint-disable-next-line no-console
@@ -47,12 +62,15 @@ if (__DEV__ && !VALID_PROVIDERS.includes(rawOcrProvider as OcrProvider)) {
 export interface AppEnv {
   /** Base URL of the verification / OCR backend. No trailing slash. */
   apiBaseUrl: string;
-  /** Which OCR provider the app talks to. */
+  /** False when API_BASE_URL was missing — callers should show a clear error. */
+  apiConfigured: boolean;
+  /** Which OCR provider the backend talks to. */
   ocrProvider: OcrProvider;
 }
 
 export const env: AppEnv = {
-  apiBaseUrl: read('API_BASE_URL', DEFAULTS.API_BASE_URL).replace(/\/+$/, ''),
+  apiBaseUrl,
+  apiConfigured,
   ocrProvider: rawOcrProvider as OcrProvider,
 };
 

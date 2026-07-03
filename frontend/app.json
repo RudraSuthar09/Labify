@@ -32,7 +32,8 @@
         {
           "cameraPermission": "LabelVerify uses the camera to scan barcodes on battery-pack labels."
         }
-      ]
+      ],
+      "expo-audio"
     ]
   }
 }
