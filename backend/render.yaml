@@ -1,0 +1,36 @@
+# Render Blueprint for the Labify backend.
+#
+# Usage: see backend/README.md → "Deploy to Render".
+#
+# NOTE ON BUILD COMMAND: we pass `--include=dev` so npm installs devDependencies
+# (TypeScript, @types) even when NODE_ENV=production is set on the service —
+# without it, `npm run build` (tsc) would fail because the compiler wouldn't be
+# installed. Only production dependencies are needed at runtime.
+services:
+  - type: web
+    name: labify-backend
+    runtime: node
+    plan: free
+    # The backend lives in a subfolder of the repo. If you use this file as a
+    # repo-root Blueprint, keep rootDir: backend. If you instead create the
+    # service manually, set the dashboard "Root Directory" to `backend`.
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Render assigns PORT automatically; declared here for visibility. Leave it
+      # unset in the dashboard and Render injects the real value at runtime.
+      - key: PORT
+        sync: false
+      - key: NODE_ENV
+        sync: false
+      - key: OCR_PROVIDER
+        sync: false
+      # The entire service-account key JSON, pasted as a single-line string.
+      # Marked as a secret — set it in the dashboard, never commit it.
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false

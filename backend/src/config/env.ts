@@ -6,6 +6,9 @@
  * failing later with a cryptic runtime crash.
  */
 import 'dotenv/config';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { z } from 'zod';
 
 const EnvSchema = z
@@ -27,8 +30,13 @@ const EnvSchema = z
     //
     // When OCR_PROVIDER === 'google', at least one must be present (enforced in
     // superRefine below). The "mock" provider needs neither.
+    //   3. GOOGLE_CREDENTIALS_JSON — the full service-account JSON as a single
+    //      stringified value. Used on hosts (Render, etc.) where uploading a key
+    //      file is awkward. At startup we write it to a temp file and point
+    //      GOOGLE_APPLICATION_CREDENTIALS at it (see materializeGoogleCredentials).
     GOOGLE_VISION_API_KEY: z.string().optional(),
     GOOGLE_APPLICATION_CREDENTIALS: z.string().optional(),
+    GOOGLE_CREDENTIALS_JSON: z.string().optional(),
 
     // Placeholder for later — accepted but not yet used.
     DATABASE_URL: z.string().optional(),
@@ -48,22 +56,79 @@ const EnvSchema = z
     if (
       val.OCR_PROVIDER === 'google' &&
       !val.GOOGLE_VISION_API_KEY &&
-      !val.GOOGLE_APPLICATION_CREDENTIALS
+      !val.GOOGLE_APPLICATION_CREDENTIALS &&
+      !val.GOOGLE_CREDENTIALS_JSON
     ) {
       ctx.addIssue({
         code: 'custom',
         path: ['GOOGLE_VISION_API_KEY'],
         message:
-          'When OCR_PROVIDER="google" you must set either GOOGLE_VISION_API_KEY ' +
-          '(an "AIza..." API key) or GOOGLE_APPLICATION_CREDENTIALS (path to a ' +
-          'service-account JSON key). Or use OCR_PROVIDER="mock" for local dev.',
+          'When OCR_PROVIDER="google" you must set one of: GOOGLE_VISION_API_KEY ' +
+          '(an "AIza..." API key), GOOGLE_APPLICATION_CREDENTIALS (path to a ' +
+          'service-account JSON key), or GOOGLE_CREDENTIALS_JSON (the key JSON ' +
+          'inline, for cloud hosts). Or use OCR_PROVIDER="mock" for local dev.',
       });
     }
   });
 
 export type Env = z.infer<typeof EnvSchema>;
 
+/**
+ * Bridge the two credential styles: a file path locally, an inline JSON string
+ * in the cloud.
+ *
+ * If GOOGLE_CREDENTIALS_JSON is set, parse it, write it to a temp file, and
+ * point GOOGLE_APPLICATION_CREDENTIALS at that file — the @google-cloud/vision
+ * client only knows how to read a file path, so this is what makes an env-var
+ * credential work on hosts like Render where uploading a key file is awkward.
+ *
+ * Runs before validation so the resulting GOOGLE_APPLICATION_CREDENTIALS counts
+ * as valid credentials in the schema's superRefine. No-op when the var is unset
+ * (local dev keeps using its file path).
+ */
+function materializeGoogleCredentials(): void {
+  const raw = process.env.GOOGLE_CREDENTIALS_JSON;
+  if (!raw || raw.trim() === '') return;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    console.error(
+      '\n❌ GOOGLE_CREDENTIALS_JSON is set but is not valid JSON.\n' +
+        '   Paste the entire service-account key file as a single-line JSON string.\n',
+    );
+    process.exit(1);
+  }
+
+  if (typeof parsed !== 'object' || parsed === null) {
+    console.error(
+      '\n❌ GOOGLE_CREDENTIALS_JSON did not parse to a JSON object.\n',
+    );
+    process.exit(1);
+  }
+
+  const filePath = path.join(os.tmpdir(), 'labify-gcp-credentials.json');
+  try {
+    // 0600 so other users on the host can't read the key.
+    fs.writeFileSync(filePath, raw, { encoding: 'utf8', mode: 0o600 });
+  } catch (err) {
+    console.error(
+      `\n❌ Failed to write Google credentials to ${filePath}: ` +
+        `${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    process.exit(1);
+  }
+
+  // Override any inherited path — the inline JSON is the source of truth here.
+  process.env.GOOGLE_APPLICATION_CREDENTIALS = filePath;
+}
+
 function loadEnv(): Env {
+  // Must run before parsing: it may set GOOGLE_APPLICATION_CREDENTIALS, which
+  // the schema below treats as valid Google credentials.
+  materializeGoogleCredentials();
+
   const parsed = EnvSchema.safeParse(process.env);
   if (!parsed.success) {
     const details = parsed.error.issues

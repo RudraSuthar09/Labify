@@ -21,6 +21,7 @@ Google Cloud Vision OCR) and reports whether the two agree.
 - [How verification works](#how-verification-works)
 - [Adding new label profiles](#adding-new-label-profiles)
 - [Swapping the OCR provider](#swapping-the-ocr-provider)
+- [Deploy to Render](#deploy-to-render)
 - [Project layout](#project-layout)
 
 ---
@@ -313,6 +314,94 @@ Textract or a self-hosted PaddleOCR:
    [`src/config/env.ts`](src/config/env.ts).
 
 No route or verification code changes.
+
+---
+
+## Deploy to Render
+
+This gives the mobile app a permanent public HTTPS URL to talk to, instead of
+your laptop's LAN IP.
+
+### Credentials in the cloud
+
+Render can't easily host the service-account **file**, so the backend also
+accepts the key **inline** via `GOOGLE_CREDENTIALS_JSON`. At startup
+[`src/config/env.ts`](src/config/env.ts) writes that JSON to a temp file and
+points `GOOGLE_APPLICATION_CREDENTIALS` at it — so **local dev uses a file,
+production uses an env var**, and the Vision client works either way.
+
+### Steps
+
+1. **Push to GitHub.** Commit the repo (the `backend/` folder included) and push
+   it to a GitHub repository. Double-check `gcp-key.json` and `.env` are **not**
+   committed — they're git-ignored, but verify with `git status` before pushing.
+
+2. **Sign up / log in at [render.com](https://render.com)** and connect your
+   GitHub account.
+
+3. **New → Web Service**, and select your repository. Render reads
+   [`render.yaml`](render.yaml) (the Blueprint) and pre-fills the service:
+   - **Name:** `labify-backend`
+   - **Root Directory:** `backend`
+   - **Build Command:** `npm install --include=dev && npm run build`
+   - **Start Command:** `node dist/server.js`
+   - **Plan:** Free
+
+   > `--include=dev` is deliberate: with `NODE_ENV=production` set, a plain
+   > `npm install` skips devDependencies and the TypeScript compiler wouldn't be
+   > available for the build. If Render doesn't pick up `render.yaml`
+   > automatically, create the Web Service manually and enter the values above
+   > (set **Root Directory** to `backend`).
+
+4. **Set the environment variables** (Dashboard → your service → Environment).
+   `PORT` is injected by Render automatically — leave it unset.
+
+   | Key | Value |
+   | --- | --- |
+   | `NODE_ENV` | `production` |
+   | `OCR_PROVIDER` | `google` |
+   | `ALLOWED_ORIGINS` | `*` |
+   | `GOOGLE_CREDENTIALS_JSON` | *paste the **entire** contents of your GCP service-account JSON as a single line* |
+
+   **Getting the one-line JSON:** open `backend/gcp-key.json`, copy everything,
+   and paste it into the value box. It's fine if it wraps visually — just don't
+   introduce real newlines between fields. To minify it to a guaranteed single
+   line:
+
+   ```bash
+   # prints the key as one line — copy the output into the Render env var
+   node -e "process.stdout.write(JSON.stringify(require('./gcp-key.json')))"
+   ```
+
+5. **Deploy.** Render builds and starts the service, then gives you a public URL
+   like `https://labify-backend.onrender.com`.
+
+6. **Test it:**
+
+   ```bash
+   curl https://labify-backend.onrender.com/health
+   # → {"status":"ok","timestamp":"..."}
+
+   curl -X POST https://labify-backend.onrender.com/api/verify \
+     -F "image=@label.jpg;type=image/jpeg" \
+     -F "barcodeValue=RKBBPFM7C000167"
+   ```
+
+7. **Point the app at it:** set the mobile app's `API_BASE_URL` to your Render
+   URL (see the frontend's `src/config/env.ts`).
+
+### ⚠️ Free-tier gotcha: cold starts
+
+Render's **free** plan **spins the service down after ~15 minutes of
+inactivity**. The next request then has to wake it, which takes **~30–60
+seconds** (you'll see the first `curl`/scan hang, then succeed). Subsequent
+requests are fast.
+
+This is fine for a demo. For production, either:
+
+- upgrade to Render's **Starter plan (~$7/month)**, which stays always-on, or
+- migrate to **Google Cloud Run** (scales to zero but cold-starts in ~1–2s, and
+  you're already on GCP as `labify-501316`).
 
 ---
 

@@ -10,6 +10,7 @@
  */
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import multer, { MulterError } from 'multer';
+import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 
 import { env, isDev } from '../config/env';
@@ -22,6 +23,29 @@ import { KNOWN_LABEL_TYPES, DEFAULT_LABEL_TYPE } from '../config/labelProfiles';
 export const verifyRouter = Router();
 
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
+
+/**
+ * Per-IP rate limit for the verification endpoints: 60 requests/minute. Guards
+ * the free-tier OCR quota (and the host) against runaway clients or abuse.
+ * Returns a clean JSON 429 rather than the library's default text body.
+ *
+ * Relies on Express `trust proxy` being set (see server.ts) so the client IP is
+ * read from X-Forwarded-For behind Render's load balancer.
+ */
+const verifyRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  handler: (_req, res) => {
+    res.status(429).json({
+      error: {
+        status: 429,
+        message: 'Too many requests. Please slow down and try again shortly.',
+      },
+    });
+  },
+});
 
 /**
  * In-memory upload handling — we forward the buffer straight to OCR and never
@@ -149,8 +173,8 @@ async function runVerification(
   );
 }
 
-/** POST /api/verify — production endpoint. */
-verifyRouter.post('/api/verify', handleUpload, (req, res, next) => {
+/** POST /api/verify — production endpoint. Rate-limited per IP. */
+verifyRouter.post('/api/verify', verifyRateLimiter, handleUpload, (req, res, next) => {
   runVerification(req, res, false).catch(next);
 });
 

@@ -16,6 +16,11 @@ import { verifyRouter } from './routes/verify';
 
 const app = express();
 
+// Behind Render's (and most PaaS) load balancers, the client IP arrives in the
+// X-Forwarded-For header. Trust the first proxy hop so req.ip and the rate
+// limiter see the real client address rather than the proxy's.
+app.set('trust proxy', 1);
+
 // Attaches a request-scoped logger at `req.log` and logs each request.
 app.use(pinoHttp({ logger }));
 
@@ -31,10 +36,15 @@ app.use(verifyRouter);
 app.use(notFoundHandler);
 app.use(errorHandler);
 
-const server = app.listen(env.PORT, () => {
+// Bind to 0.0.0.0 so the server is reachable from outside the container —
+// required by Render (and any PaaS). Binding to localhost would only accept
+// connections from within the same host.
+const HOST = '0.0.0.0';
+
+const server = app.listen(env.PORT, HOST, () => {
   logger.info(
-    { port: env.PORT, ocrProvider: env.OCR_PROVIDER, env: env.NODE_ENV },
-    `🚀 LabelVerify backend listening on http://localhost:${env.PORT}`,
+    { host: HOST, port: env.PORT, ocrProvider: env.OCR_PROVIDER, env: env.NODE_ENV },
+    `🚀 LabelVerify backend listening on http://${HOST}:${env.PORT}`,
   );
 });
 
