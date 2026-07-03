@@ -25,6 +25,7 @@ import type {
   VerificationStatus,
 } from '../types/verification';
 import { useResultFeedback } from '../hooks/useResultFeedback';
+import { extractRsn } from '../utils/barcode';
 
 // Barcode formats we care about on battery-pack labels.
 const BARCODE_TYPES: BarcodeType[] = [
@@ -144,8 +145,12 @@ export default function ScanScreen() {
       lastScanRef.current = { value: scan.data, at: now };
       const gen = ++genRef.current;
 
+      // The label's QR encodes an XML doc with the RSN inside <SRNO_7S>; the 1-D
+      // barcode encodes the RSN directly. Reduce either to the bare RSN.
+      const rsn = extractRsn(scan.data);
+
       // Show what was detected immediately, before the photo/verify round-trip.
-      setPendingBarcode(scan.data);
+      setPendingBarcode(rsn);
       setResult(null);
       setError(null);
       setPhase('capturing');
@@ -164,7 +169,7 @@ export default function ScanScreen() {
       if (gen !== genRef.current) return; // cancelled during capture
       pendingImageRef.current = imageUri;
       setPhase('verifying');
-      void runVerification(scan.data, imageUri, gen);
+      void runVerification(rsn, imageUri, gen);
     },
     [runVerification],
   );
