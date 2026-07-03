@@ -18,10 +18,17 @@ const EnvSchema = z
 
     OCR_PROVIDER: z.enum(['google', 'mock']).default('google'),
 
-    // Google Cloud Vision API key (the "AIza..." key). Used to call the Vision
-    // REST endpoint directly. Required only when OCR_PROVIDER === 'google'
-    // (enforced in superRefine).
+    // Two ways to authenticate the Google Vision client — provide EITHER:
+    //
+    //   1. GOOGLE_VISION_API_KEY — a simple "AIza..." API key. Quick to set up.
+    //   2. GOOGLE_APPLICATION_CREDENTIALS — path to a service-account JSON key.
+    //      The @google-cloud/vision client reads this automatically. Preferred
+    //      for production (finer-grained IAM, key rotation).
+    //
+    // When OCR_PROVIDER === 'google', at least one must be present (enforced in
+    // superRefine below). The "mock" provider needs neither.
     GOOGLE_VISION_API_KEY: z.string().optional(),
+    GOOGLE_APPLICATION_CREDENTIALS: z.string().optional(),
 
     // Placeholder for later — accepted but not yet used.
     DATABASE_URL: z.string().optional(),
@@ -38,13 +45,18 @@ const EnvSchema = z
       ),
   })
   .superRefine((val, ctx) => {
-    if (val.OCR_PROVIDER === 'google' && !val.GOOGLE_VISION_API_KEY) {
+    if (
+      val.OCR_PROVIDER === 'google' &&
+      !val.GOOGLE_VISION_API_KEY &&
+      !val.GOOGLE_APPLICATION_CREDENTIALS
+    ) {
       ctx.addIssue({
         code: 'custom',
         path: ['GOOGLE_VISION_API_KEY'],
         message:
-          'GOOGLE_VISION_API_KEY is required when OCR_PROVIDER="google". ' +
-          'Set your Vision API key, or use OCR_PROVIDER="mock" for local dev.',
+          'When OCR_PROVIDER="google" you must set either GOOGLE_VISION_API_KEY ' +
+          '(an "AIza..." API key) or GOOGLE_APPLICATION_CREDENTIALS (path to a ' +
+          'service-account JSON key). Or use OCR_PROVIDER="mock" for local dev.',
       });
     }
   });

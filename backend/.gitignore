@@ -15,6 +15,7 @@ credentials/
 service-account*.json
 google-vision*.json
 *-credentials.json
+gcp-key.json
 
 # logs
 *.log
