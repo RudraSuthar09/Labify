@@ -41,12 +41,37 @@ const EnvSchema = z
     // Placeholder for later — accepted but not yet used.
     DATABASE_URL: z.string().optional(),
 
-    // Supabase Storage — used to persist every scanned label photo for audit.
-    // All three are optional: if URL or service key is missing, storage is
-    // disabled (verification still succeeds; imageUrl is null in the response).
-    SUPABASE_URL: z.string().url().optional().or(z.literal('').transform(() => undefined)),
+    // --- Supabase: scan persistence + image archive -------------------------
+    // Both URL and service key must be set to enable persistence/storage; if
+    // either is missing the app still verifies scans, just without archiving
+    // (getScanStore / getStorageProvider return undefined). The service-role key
+    // is server-only — never expose it to the frontend.
+    SUPABASE_URL: z.string().url().optional(),
     SUPABASE_SERVICE_KEY: z.string().optional(),
+    // Storage bucket for archived label photos. Has a sensible default so only
+    // URL + key are strictly required to turn the feature on. Matches the
+    // bucket documented in .env.example.
     SUPABASE_STORAGE_BUCKET: z.string().default('label-scans'),
+
+    // --- Check C: external (Reliance/Geon) serial validation ----------------
+    // The authoritative API we POST the verified serial to. Third-party and
+    // occasionally flaky, so it is called defensively (timeout + never throws).
+    EXTERNAL_VALIDATION_URL: z
+      .string()
+      .url()
+      .default('https://api.geon.world/api/Check_RIL_Barcode'),
+    // Hard ceiling on how long a single external call may block a verification.
+    EXTERNAL_VALIDATION_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(8000),
+    // Set to "false" to skip the external call entirely (handy for local dev
+    // when the API is unreachable). Accepts true/false/1/0/yes/no.
+    EXTERNAL_VALIDATION_ENABLED: z
+      .string()
+      .default('true')
+      .transform((v) => !['false', '0', 'no', 'off'].includes(v.trim().toLowerCase())),
 
     // Comma-separated origins → string[]. Empty string means "no origins".
     ALLOWED_ORIGINS: z

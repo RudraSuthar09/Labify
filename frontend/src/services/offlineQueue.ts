@@ -50,8 +50,10 @@ export interface QueueEntry {
   id: string;
   /** Unix ms — when the scan happened on-device. */
   createdAt: number;
-  /** Value decoded off the barcode. */
-  barcodeValue: string;
+  /** Linear barcode value decoded off the label, or null if none detected. */
+  barcodeValue: string | null;
+  /** QR code value decoded off the label, or null if none detected. */
+  qrValue: string | null;
   /** Label profile the operator picked (currently always battery_pack). */
   labelType: string;
   /** Persistent file:// URI to the copied image (NOT the original cache path). */
@@ -87,15 +89,23 @@ async function readQueue(): Promise<QueueEntry[]> {
     }
     // Defensive: drop any entry missing the required fields (e.g. an older
     // schema version). Never crash on user-authored garbage in storage.
-    cache = parsed.filter(
-      (e): e is QueueEntry =>
-        e &&
-        typeof e === 'object' &&
-        typeof e.id === 'string' &&
-        typeof e.barcodeValue === 'string' &&
-        typeof e.imageUri === 'string' &&
-        typeof e.createdAt === 'number',
-    );
+    // Codes are lenient (either may be null), but at least one must be present.
+    cache = parsed
+      .filter(
+        (e): e is Record<string, unknown> =>
+          e &&
+          typeof e === 'object' &&
+          typeof (e as QueueEntry).id === 'string' &&
+          typeof (e as QueueEntry).imageUri === 'string' &&
+          typeof (e as QueueEntry).createdAt === 'number' &&
+          (typeof (e as QueueEntry).barcodeValue === 'string' ||
+            typeof (e as QueueEntry).qrValue === 'string'),
+      )
+      .map((raw) => {
+        const e = raw as unknown as QueueEntry;
+        // Normalise older rows that predate qrValue.
+        return { ...e, barcodeValue: e.barcodeValue ?? null, qrValue: e.qrValue ?? null };
+      });
     return cache;
   } catch {
     cache = [];
@@ -202,7 +212,8 @@ function deleteImage(uri: string): void {
 // --- Public API: enqueue --------------------------------------------------
 
 export interface EnqueueInput {
-  barcodeValue: string;
+  barcodeValue: string | null;
+  qrValue: string | null;
   labelType: string;
   /** The original cache-directory URI from expo-camera. Will be copied. */
   imageUri: string;
@@ -230,6 +241,7 @@ export async function enqueue(input: EnqueueInput): Promise<EnqueueResult> {
     id,
     createdAt: Date.now(),
     barcodeValue: input.barcodeValue,
+    qrValue: input.qrValue,
     labelType: input.labelType,
     imageUri: persistedUri,
     attemptCount: 0,
@@ -321,7 +333,7 @@ export async function syncQueue(): Promise<SyncResult> {
       let result: VerificationResult | undefined;
       let error: VerificationError | undefined;
       try {
-        result = await verifyLabel(entry.barcodeValue, entry.imageUri);
+        result = await verifyLabel(entry.barcodeValue, entry.qrValue, entry.imageUri);
       } catch (e) {
         error =
           e instanceof VerificationCallError

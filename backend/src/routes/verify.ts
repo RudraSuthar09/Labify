@@ -91,20 +91,37 @@ function handleUpload(req: Request, res: Response, next: NextFunction): void {
   });
 }
 
-/** Body validation. The image itself is validated separately (by multer). */
-const VerifyBodySchema = z.object({
-  barcodeValue: z
-    .string({ message: 'barcodeValue is required.' })
-    .trim()
-    .min(1, 'barcodeValue must not be empty.'),
-  labelType: z
-    .string()
-    .trim()
-    .default(DEFAULT_LABEL_TYPE)
-    .refine((t) => KNOWN_LABEL_TYPES.includes(t), {
-      message: `Unknown labelType. Known types: ${KNOWN_LABEL_TYPES.join(', ')}.`,
-    }),
-});
+/**
+ * Body validation. The image itself is validated separately (by multer).
+ *
+ * `barcodeValue` (linear barcode) and `qrValue` (QR code) are both optional
+ * individually, but at least one must be present — a verification needs at
+ * least one scanned code. Empty strings are normalised to null so the client
+ * can send `''` for "not detected".
+ */
+const emptyToNull = z
+  .string()
+  .trim()
+  .transform((v) => (v === '' ? null : v))
+  .nullish()
+  .transform((v) => v ?? null);
+
+const VerifyBodySchema = z
+  .object({
+    barcodeValue: emptyToNull,
+    qrValue: emptyToNull,
+    labelType: z
+      .string()
+      .trim()
+      .default(DEFAULT_LABEL_TYPE)
+      .refine((t) => KNOWN_LABEL_TYPES.includes(t), {
+        message: `Unknown labelType. Known types: ${KNOWN_LABEL_TYPES.join(', ')}.`,
+      }),
+  })
+  .refine((b) => b.barcodeValue !== null || b.qrValue !== null, {
+    message: 'At least one of barcodeValue or qrValue must be present.',
+    path: ['barcodeValue'],
+  });
 
 /**
  * Build the object-store path for one scan. Date-partitioned so listings and
@@ -180,7 +197,7 @@ async function runVerification(
       })),
     });
   }
-  const { barcodeValue, labelType } = parsed.data;
+  const { barcodeValue, qrValue, labelType } = parsed.data;
 
   // 2. Ensure an image was actually uploaded.
   if (!req.file?.buffer?.length) {
@@ -200,7 +217,7 @@ async function runVerification(
   const ocrDurationMs = Date.now() - ocrStart;
 
   if (!ocrSettled.ok) {
-    logger.error({ err: ocrSettled.err, barcodeValue }, 'OCR provider failed');
+    logger.error({ err: ocrSettled.err, barcodeValue, qrValue }, 'OCR provider failed');
     throw new HttpError(
       502,
       'OCR service is currently unavailable. Please try again shortly.',
@@ -208,8 +225,13 @@ async function runVerification(
   }
   const { text: ocrText, raw: ocrRaw } = ocrSettled.result;
 
-  // 4. Compare barcode vs label serial, then stamp the archive URL onto it.
-  const verification = { ...verifyLabel({ barcodeValue, ocrText, labelType }), imageUrl };
+  // 4. Run all checks (three-way match, config, external validation), then stamp
+  //    the archive URL onto the result. Async because Check C (the external-API
+  //    call) performs a bounded network call.
+  const verification = {
+    ...(await verifyLabel({ barcodeValue, qrValue, ocrText, labelType })),
+    imageUrl,
+  };
 
   // 5. Persist to the audit log. Blocking (not fire-and-forget) so a scan is
   //    guaranteed visible in /api/scans by the time the mobile app re-fetches
@@ -243,8 +265,12 @@ async function runVerification(
   logger.info(
     {
       barcodeValue,
+      qrValue,
       labelType,
       status: verification.status,
+      codesMatch: verification.codesMatch,
+      configMatch: verification.configCheck.match,
+      externalStatus: verification.externalValidation.status,
       reason: verification.reason,
       imageUrl,
       ocrDurationMs,

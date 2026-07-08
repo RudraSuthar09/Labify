@@ -56,14 +56,18 @@ function serverMessage(data: unknown): string | undefined {
 /**
  * Verify a scanned label against its printed serial.
  *
- * @param barcodeValue Decoded barcode/QR payload.
+ * @param barcodeValue Decoded linear-barcode payload (bare RSN), or null if none
+ *                     was detected in the collection window.
+ * @param qrValue      Decoded QR payload (bare RSN), or null if none detected.
+ *                     At least one of barcodeValue / qrValue should be non-null.
  * @param imageUri     Local `file://` URI of the captured still (from expo-camera).
  *                     Works as-is on both iOS and Android — FormData handles the
  *                     file URI natively, no base64 or path conversion needed.
  * @throws {VerificationCallError} on any network/timeout/server/config failure.
  */
 export async function verifyLabel(
-  barcodeValue: string,
+  barcodeValue: string | null,
+  qrValue: string | null,
   imageUri: string,
 ): Promise<VerificationResult> {
   // Guard: if the app was built without API_BASE_URL, fail with a clear message
@@ -86,7 +90,10 @@ export async function verifyLabel(
     type: 'image/jpeg',
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any);
-  form.append('barcodeValue', barcodeValue);
+  // Send empty string for a code that wasn't detected; the backend normalises
+  // '' → null and requires at least one of the two to be present.
+  form.append('barcodeValue', barcodeValue ?? '');
+  form.append('qrValue', qrValue ?? '');
   form.append('labelType', 'battery_pack');
 
   // Use React Native's native fetch — not axios. RN sets the multipart

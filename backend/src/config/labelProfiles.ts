@@ -41,6 +41,26 @@ export interface LabelProfile {
    * FAIL. 0 disables the warning tier (only exact matches pass).
    */
   fuzzyTolerance: number;
+
+  // --- Check B: config-character consistency (optional per profile) ----------
+  //
+  // The label header carries a config code like "7S1P/15S1P"; its leading module
+  // count (7 or 8) must also appear at a fixed position inside the RSN. These
+  // three fields drive that cross-check. Omit them on profiles without a config
+  // code and the check is simply skipped.
+
+  /**
+   * Regex whose first capture group is the leading module count from the header
+   * config, e.g. matches "7S1P/15S1P" and captures "7".
+   */
+  headerConfigRegex?: RegExp;
+  /**
+   * 1-indexed position of the config digit within the RSN. For RSN
+   * "RKBBPFM7C000167" this is 8 (the "7" after "RKBBPFM").
+   */
+  rsnConfigCharPosition?: number;
+  /** Config digits we recognise; anything else is treated as unreadable. */
+  validConfigChars?: string[];
 }
 
 /**
@@ -58,6 +78,17 @@ const batteryPackProfile: LabelProfile = {
   displayName: 'Battery Pack',
   barcodeField: 'RSN',
   fuzzyTolerance: 1,
+
+  // Check B config rule (see examples in the block comment above):
+  //   header "7S1P/15S1P" → config digit "7"
+  //   RSN "RKBBPFM7C000167" → char at position 8 (1-indexed) is "7"
+  // ASSUMPTION: the config digit always sits at position 8 of the RSN, i.e. the
+  // RSN format is RKBBPFM{N}C{6 digits}. If a future RSN layout moves the digit,
+  // update rsnConfigCharPosition here — no verifier code needs to change.
+  headerConfigRegex: /(\d+)S1P\s*\/\s*\d+S1P/i,
+  rsnConfigCharPosition: 8,
+  validConfigChars: ['7', '8'],
+
   fieldsToExtract: [
     {
       // The critical field: the RSN the barcode must match.

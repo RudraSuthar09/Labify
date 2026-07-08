@@ -24,12 +24,14 @@ import type {
   VerificationResult,
   VerificationError,
   VerificationStatus,
+  CodesDetected,
 } from '../types/verification';
 import { useResultFeedback } from '../hooks/useResultFeedback';
 import { usePendingSync } from '../hooks/usePendingSync';
 import { extractRsn } from '../utils/barcode';
 
-// Barcode formats we care about on battery-pack labels.
+// Barcode formats we care about on battery-pack labels. The scanner reports the
+// linear barcode AND the QR code from the same frame, which Check A relies on.
 const BARCODE_TYPES: BarcodeType[] = [
   'qr',
   'code128',
@@ -38,6 +40,10 @@ const BARCODE_TYPES: BarcodeType[] = [
   'pdf417',
   'ean13',
 ];
+
+// After the FIRST code is seen, keep collecting for this long so we can capture
+// both the linear barcode and the QR code before firing verification (Check A).
+const COLLECT_WINDOW_MS = 2000;
 
 // Ignore repeat detections of the same code within this window (ms).
 const DEBOUNCE_MS = 2000;
@@ -52,7 +58,29 @@ const BANNER: Record<VerificationStatus, { bg: string; label: string }> = {
   warning: { bg: '#F59E0B', label: 'WARNING · Review Required' },
 };
 
-type Phase = 'idle' | 'capturing' | 'verifying' | 'success' | 'queued' | 'error';
+/** Per-check row status. Drives the icon + colour in the Checks panel. */
+type CheckState = 'pass' | 'fail' | 'warning' | 'skipped';
+
+const CHECK_ICON: Record<CheckState, { glyph: string; color: string }> = {
+  pass: { glyph: '✓', color: '#16A34A' },
+  fail: { glyph: '✗', color: '#DC2626' },
+  warning: { glyph: '⚠', color: '#F59E0B' },
+  skipped: { glyph: '—', color: '#9CA3AF' },
+};
+
+type Phase =
+  | 'idle'
+  | 'collecting'
+  | 'capturing'
+  | 'verifying'
+  | 'success'
+  | 'queued'
+  | 'error';
+
+/** True for QR (and QR-like 2D) codes; everything else is a linear barcode. */
+function isQrType(type: string): boolean {
+  return type === 'qr';
+}
 
 export default function ScanScreen() {
   const navigation = useNavigation();
@@ -64,13 +92,31 @@ export default function ScanScreen() {
   const [phase, setPhase] = useState<Phase>('idle');
   const [result, setResult] = useState<VerificationResult | null>(null);
   const [error, setError] = useState<VerificationError | null>(null);
-  const [pendingBarcode, setPendingBarcode] = useState('');
+  // What we've collected in the current window, for the "Detecting…" overlay.
+  const [detected, setDetected] = useState<{ barcode: string | null; qr: string | null }>({
+    barcode: null,
+    qr: null,
+  });
   const [soundEnabled, setSoundEnabled] = useState(true);
 
   // The image captured for the current scan — kept so Retry can reuse it.
   const pendingImageRef = useRef('');
+  // The codes collected for the current scan — kept so Retry can reuse them.
+  const pendingCodesRef = useRef<{ barcode: string | null; qr: string | null }>({
+    barcode: null,
+    qr: null,
+  });
   // Hard lock so the async capture/verify pipeline only runs once per scan.
   const busyRef = useRef(false);
+  // True while inside the 2s collection window (readable from the scan callback).
+  const collectingRef = useRef(false);
+  // Codes accumulated during the current collection window.
+  const collectedRef = useRef<{ barcode: string | null; qr: string | null }>({
+    barcode: null,
+    qr: null,
+  });
+  // Handle for the collection-window timer, so we can cancel it on reset.
+  const collectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Debounce guard: last code + time so rapid re-fires are dropped.
   const lastScanRef = useRef<{ value: string; at: number } | null>(null);
   // Generation counter — bumping it invalidates any in-flight capture/verify
@@ -82,10 +128,14 @@ export default function ScanScreen() {
     soundRef.current = soundEnabled;
   }, [soundEnabled]);
 
-  // Header actions: pending-sync badge (only when > 0) + sound toggle + settings
-  // shortcut. `navigation.navigate` bubbles up from the tab navigator to the
-  // root stack, so 'Settings' resolves even though it lives on a different
-  // navigator.
+  // Clean up any pending timer on unmount.
+  useEffect(() => {
+    return () => {
+      if (collectTimerRef.current) clearTimeout(collectTimerRef.current);
+    };
+  }, []);
+
+  // Header sound toggle (the only setting for now).
   useLayoutEffect(() => {
     navigation.setOptions({
       headerRight: () => (
@@ -123,21 +173,33 @@ export default function ScanScreen() {
 
   const resetToIdle = useCallback(() => {
     genRef.current += 1; // invalidate anything in flight
+    if (collectTimerRef.current) {
+      clearTimeout(collectTimerRef.current);
+      collectTimerRef.current = null;
+    }
     busyRef.current = false;
+    collectingRef.current = false;
+    collectedRef.current = { barcode: null, qr: null };
     lastScanRef.current = null;
     pendingImageRef.current = '';
+    pendingCodesRef.current = { barcode: null, qr: null };
     // Clear result/error and return to scanning in the same batch so no stale
     // data is visible for even a frame.
     setResult(null);
     setError(null);
-    setPendingBarcode('');
+    setDetected({ barcode: null, qr: null });
     setPhase('idle');
   }, []);
 
   const runVerification = useCallback(
-    async (barcode: string, imageUri: string, gen: number) => {
+    async (
+      barcode: string | null,
+      qr: string | null,
+      imageUri: string,
+      gen: number,
+    ) => {
       try {
-        const res = await verifyLabel(barcode, imageUri);
+        const res = await verifyLabel(barcode, qr, imageUri);
         if (gen !== genRef.current) return; // cancelled / reset meanwhile
         setResult(res);
         setError(null);
@@ -156,6 +218,7 @@ export default function ScanScreen() {
         // saving and we show the raw error instead.
         const enqueued = await enqueue({
           barcodeValue: barcode,
+          qrValue: qr,
           labelType: 'battery_pack',
           imageUri,
           cause: info,
@@ -177,28 +240,17 @@ export default function ScanScreen() {
     [playFeedback],
   );
 
-  const handleBarcode = useCallback(
-    async (scan: BarcodeScanningResult) => {
-      const now = Date.now();
-      const last = lastScanRef.current;
-      if (
-        busyRef.current ||
-        (last && last.value === scan.data && now - last.at < DEBOUNCE_MS)
-      ) {
-        return;
-      }
+  // Runs when the 2s collection window closes: capture the still and verify with
+  // whatever codes were gathered (barcode, qr, or both).
+  const finishCollection = useCallback(
+    async (gen: number) => {
+      if (gen !== genRef.current) return; // cancelled during the window
+      collectingRef.current = false;
+      collectTimerRef.current = null;
       busyRef.current = true;
-      lastScanRef.current = { value: scan.data, at: now };
-      const gen = ++genRef.current;
 
-      // The label's QR encodes an XML doc with the RSN inside <SRNO_7S>; the 1-D
-      // barcode encodes the RSN directly. Reduce either to the bare RSN.
-      const rsn = extractRsn(scan.data);
-
-      // Show what was detected immediately, before the photo/verify round-trip.
-      setPendingBarcode(rsn);
-      setResult(null);
-      setError(null);
+      const codes = collectedRef.current;
+      pendingCodesRef.current = codes;
       setPhase('capturing');
 
       // Yield one frame so the CameraView finishes handling the barcode scan
@@ -230,18 +282,69 @@ export default function ScanScreen() {
       if (gen !== genRef.current) return; // cancelled during capture
       pendingImageRef.current = imageUri;
       setPhase('verifying');
-      void runVerification(rsn, imageUri, gen);
+      void runVerification(codes.barcode, codes.qr, imageUri, gen);
     },
     [runVerification],
   );
 
+  const handleBarcode = useCallback(
+    (scan: BarcodeScanningResult) => {
+      if (busyRef.current) return;
+
+      const now = Date.now();
+      const last = lastScanRef.current;
+      // Reduce the QR XML / linear payload to the bare RSN before storing.
+      const rsn = extractRsn(scan.data);
+      const isQr = isQrType(scan.type);
+
+      if (!collectingRef.current) {
+        // First code of a new scan → open the collection window.
+        if (
+          last &&
+          last.value === scan.data &&
+          now - last.at < DEBOUNCE_MS
+        ) {
+          return; // still cooling down from the previous scan
+        }
+        lastScanRef.current = { value: scan.data, at: now };
+
+        const gen = ++genRef.current;
+        collectingRef.current = true;
+        collectedRef.current = { barcode: null, qr: null };
+        if (isQr) collectedRef.current.qr = rsn;
+        else collectedRef.current.barcode = rsn;
+        setDetected({ ...collectedRef.current });
+        setPhase('collecting');
+
+        collectTimerRef.current = setTimeout(() => {
+          void finishCollection(gen);
+        }, COLLECT_WINDOW_MS);
+        return;
+      }
+
+      // Already collecting → record the first value seen for each type.
+      if (isQr) {
+        if (!collectedRef.current.qr) {
+          collectedRef.current.qr = rsn;
+          setDetected({ ...collectedRef.current });
+        }
+      } else if (!collectedRef.current.barcode) {
+        collectedRef.current.barcode = rsn;
+        setDetected({ ...collectedRef.current });
+      }
+    },
+    [finishCollection],
+  );
+
   const handleRetry = useCallback(() => {
     const gen = ++genRef.current;
+    busyRef.current = true;
     setError(null);
     setResult(null);
     setPhase('verifying');
-    void runVerification(pendingBarcode, pendingImageRef.current, gen);
-  }, [pendingBarcode, runVerification]);
+    const { barcode, qr } = pendingCodesRef.current;
+    void runVerification(barcode, qr, pendingImageRef.current, gen);
+  }, [runVerification]);
 
   const handleCancelInFlight = useCallback(() => {
     // Invalidate the in-flight request and go back to scanning.
@@ -282,6 +385,8 @@ export default function ScanScreen() {
 
   // --- Camera + overlays -----------------------------------------------------
 
+  const scannerActive = phase === 'idle' || phase === 'collecting';
+
   return (
     <View style={styles.container}>
       <CameraView
@@ -289,14 +394,31 @@ export default function ScanScreen() {
         style={StyleSheet.absoluteFill}
         facing="back"
         barcodeScannerSettings={{ barcodeTypes: BARCODE_TYPES }}
-        // Only listen while idle — pauses re-firing during capture/verify/result.
-        onBarcodeScanned={phase === 'idle' ? handleBarcode : undefined}
+        // Listen while idle AND during the collection window so both codes land.
+        onBarcodeScanned={scannerActive ? handleBarcode : undefined}
       />
 
       {phase === 'idle' && (
         <View style={styles.overlay} pointerEvents="none">
           <View style={styles.scanFrame} />
-          <Text style={styles.guideText}>Align the label barcode inside the frame</Text>
+          <Text style={styles.guideText}>
+            Align the label so the barcode and QR code are both in the frame
+          </Text>
+        </View>
+      )}
+
+      {phase === 'collecting' && (
+        <View style={styles.overlayDim} pointerEvents="none">
+          <ActivityIndicator size="large" color="#fff" />
+          <Text style={styles.verifyingText}>Detecting all codes…</Text>
+          <View style={styles.detectRow}>
+            <Text style={[styles.detectChip, detected.barcode && styles.detectChipOn]}>
+              {detected.barcode ? '✓' : '○'} Barcode
+            </Text>
+            <Text style={[styles.detectChip, detected.qr && styles.detectChipOn]}>
+              {detected.qr ? '✓' : '○'} QR
+            </Text>
+          </View>
         </View>
       )}
 
@@ -304,16 +426,14 @@ export default function ScanScreen() {
         <View style={styles.overlayDim} pointerEvents="none">
           <ActivityIndicator size="large" color="#fff" />
           <Text style={styles.verifyingText}>Captured</Text>
-          {pendingBarcode ? (
-            <Text style={styles.capturedCode} numberOfLines={2}>
-              {pendingBarcode}
-            </Text>
-          ) : null}
         </View>
       )}
 
       {phase === 'verifying' && (
-        <VerifyingOverlay barcode={pendingBarcode} onCancel={handleCancelInFlight} />
+        <VerifyingOverlay
+          barcode={pendingCodesRef.current.barcode ?? pendingCodesRef.current.qr ?? ''}
+          onCancel={handleCancelInFlight}
+        />
       )}
 
       {phase === 'success' && result && (
@@ -322,7 +442,7 @@ export default function ScanScreen() {
 
       {phase === 'queued' && (
         <QueuedView
-          barcode={pendingBarcode}
+          barcode={pendingCodesRef.current.barcode ?? pendingCodesRef.current.qr ?? ''}
           cause={error}
           onScanNext={resetToIdle}
           onOpenSettings={() => navigation.navigate('Settings')}
@@ -376,6 +496,100 @@ function VerifyingOverlay({
   );
 }
 
+// --- Per-check status derivation ---------------------------------------------
+
+/** Codes-match row: compare every present code value (barcode / qr / printed). */
+function codesRowState(codes: CodesDetected): { state: CheckState; summary: string } {
+  const present = [codes.barcode, codes.qr, codes.printedRsn].filter(
+    (v): v is string => !!v,
+  );
+  if (present.length === 0) {
+    return { state: 'skipped', summary: 'No codes detected' };
+  }
+  const allEqual = present.every((v) => v === present[0]);
+  if (!allEqual) {
+    return { state: 'fail', summary: 'Detected codes disagree' };
+  }
+  if (present.length === 3) {
+    return { state: 'pass', summary: 'Barcode = QR = Printed RSN' };
+  }
+  return {
+    state: 'warning',
+    summary: `Only ${present.length} of 3 detected; they agree`,
+  };
+}
+
+function configRowState(
+  match: boolean | null,
+  headerConfig: string | null,
+  rsnConfigChar: string | null,
+): { state: CheckState; summary: string } {
+  if (match === null) {
+    return { state: 'skipped', summary: 'Config code not readable' };
+  }
+  if (match) {
+    return {
+      state: 'pass',
+      summary: `Header ${headerConfig}S1P ↔ RSN digit ${rsnConfigChar}`,
+    };
+  }
+  return {
+    state: 'fail',
+    summary: `Header ${headerConfig}S1P ≠ RSN digit ${rsnConfigChar}`,
+  };
+}
+
+function fieldsRowState(missingFields: string[]): { state: CheckState; summary: string } {
+  const missing = missingFields.filter((f) => f !== 'ConfigCode');
+  if (missing.length === 0) {
+    return { state: 'pass', summary: 'All fields readable' };
+  }
+  return {
+    state: 'warning',
+    summary: `Missing: ${missing.join(', ')}`,
+  };
+}
+
+function externalRowState(
+  status: VerificationResult['externalValidation']['status'],
+  rawMessage: string,
+): { state: CheckState; summary: string } {
+  switch (status) {
+    case 'ok':
+      return { state: 'pass', summary: 'Message1: OK' };
+    case 'not_ok':
+      return { state: 'fail', summary: 'Message1: NOT_OK' };
+    case 'error':
+      return { state: 'warning', summary: rawMessage || 'API unreachable' };
+    case 'skipped':
+    default:
+      return { state: 'skipped', summary: rawMessage || 'Skipped' };
+  }
+}
+
+function CheckRow({
+  state,
+  title,
+  summary,
+}: {
+  state: CheckState;
+  title: string;
+  summary: string;
+}) {
+  const icon = CHECK_ICON[state];
+  return (
+    <View style={styles.checkRow}>
+      <Text style={[styles.checkIcon, { color: icon.color }]}>{icon.glyph}</Text>
+      <View style={styles.checkTextCol}>
+        <Text style={styles.checkTitle}>{title}</Text>
+        <Text style={styles.checkSummary} numberOfLines={2}>
+          {summary}
+        </Text>
+      </View>
+    </View>
+  );
+}
+
 // --- Result view -------------------------------------------------------------
 
 function ResultView({
@@ -387,6 +601,19 @@ function ResultView({
 }) {
   const banner = BANNER[result.status];
   const fields = Object.entries(result.extractedFields);
+  const [showDetails, setShowDetails] = useState(false);
+
+  const codesRow = codesRowState(result.codesDetected);
+  const configRow = configRowState(
+    result.configCheck.match,
+    result.configCheck.headerConfig,
+    result.configCheck.rsnConfigChar,
+  );
+  const fieldsRow = fieldsRowState(result.missingFields);
+  const externalRow = externalRowState(
+    result.externalValidation.status,
+    result.externalValidation.rawMessage,
+  );
 
   return (
     <SafeAreaView style={styles.resultRoot} edges={['top', 'bottom']}>
@@ -395,10 +622,36 @@ function ResultView({
       </View>
 
       <ScrollView contentContainerStyle={styles.cardScroll}>
+        {/* Checks panel — the at-a-glance summary operators scan first. */}
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Checks</Text>
+          <CheckRow state={codesRow.state} title="Codes Match" summary={codesRow.summary} />
+          <CheckRow state={configRow.state} title="Config Check" summary={configRow.summary} />
+          <CheckRow
+            state={fieldsRow.state}
+            title="Field Extraction"
+            summary={fieldsRow.summary}
+          />
+          <CheckRow
+            state={externalRow.state}
+            title="External API"
+            summary={externalRow.summary}
+          />
+        </View>
+
         <View style={styles.card}>
           <Text style={styles.fieldLabel}>Scanned Barcode</Text>
           <Text style={styles.serialLarge} numberOfLines={2} selectable>
-            {result.decodedBarcode}
+            {result.decodedBarcode ?? '—'}
+          </Text>
+
+          <Text style={[styles.fieldLabel, styles.spacedTop]}>Scanned QR</Text>
+          <Text
+            style={[styles.serialLarge, !result.decodedQr && styles.mutedSerial]}
+            numberOfLines={2}
+            selectable
+          >
+            {result.decodedQr ?? 'Not detected'}
           </Text>
 
           <Text style={[styles.fieldLabel, styles.spacedTop]}>Expected (from label)</Text>
@@ -449,6 +702,44 @@ function ResultView({
           )}
 
           <Text style={styles.reasonText}>{result.reason}</Text>
+
+          {/* Details toggle — full OCR text, raw API response, detected codes. */}
+          <Pressable
+            style={styles.detailsToggle}
+            onPress={() => setShowDetails((v) => !v)}
+          >
+            <Text style={styles.detailsToggleText}>
+              {showDetails ? '▾ Hide details' : '▸ Details'}
+            </Text>
+          </Pressable>
+
+          {showDetails && (
+            <View style={styles.detailsBox}>
+              <Text style={styles.detailsHeading}>Detected codes</Text>
+              <Text style={styles.detailsMono} selectable>
+                barcode: {result.codesDetected.barcode ?? '—'}
+                {'\n'}qr: {result.codesDetected.qr ?? '—'}
+                {'\n'}printed: {result.codesDetected.printedRsn ?? '—'}
+              </Text>
+
+              <Text style={[styles.detailsHeading, styles.spacedTop]}>
+                External API response
+              </Text>
+              <Text style={styles.detailsMono} selectable>
+                status: {result.externalValidation.status}
+                {'\n'}Message1: {result.externalValidation.rawMessage || '—'}
+                {result.externalValidation.error
+                  ? `\nerror: ${result.externalValidation.error}`
+                  : ''}
+                {'\n'}durationMs: {result.externalValidation.durationMs}
+              </Text>
+
+              <Text style={[styles.detailsHeading, styles.spacedTop]}>Full OCR text</Text>
+              <Text style={styles.detailsMono} selectable>
+                {result.ocrText || '(empty)'}
+              </Text>
+            </View>
+          )}
         </View>
       </ScrollView>
 
@@ -599,7 +890,7 @@ const styles = StyleSheet.create({
     textShadowRadius: 4,
   },
 
-  // Dimmed overlays (capturing / verifying)
+  // Dimmed overlays (collecting / capturing / verifying)
   overlayDim: {
     ...StyleSheet.absoluteFillObject,
     alignItems: 'center',
@@ -622,19 +913,35 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     opacity: 0.9,
   },
+  detectRow: { flexDirection: 'row', gap: 12 },
+  detectChip: {
+    color: '#D1D5DB',
+    fontSize: 16,
+    fontWeight: '700',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 999,
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,255,255,0.4)',
+    overflow: 'hidden',
+  },
+  detectChipOn: {
+    color: '#052e16',
+    backgroundColor: '#4ADE80',
+    borderColor: '#4ADE80',
+  },
 
-  // Queued view (offline / server-hiccup safe state)
+  // Result view
+  resultRoot: { ...StyleSheet.absoluteFillObject, backgroundColor: '#F3F4F6' },
+  // Queued view reuses the result layout with a neutral blue-grey banner.
   queuedRoot: { ...StyleSheet.absoluteFillObject, backgroundColor: '#F3F4F6' },
   queuedBanner: {
     width: '100%',
     paddingVertical: 22,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#0369A1', // slate/blue: distinct from pass/fail/warn
+    backgroundColor: '#475569',
   },
-
-  // Result view
-  resultRoot: { ...StyleSheet.absoluteFillObject, backgroundColor: '#F3F4F6' },
   banner: {
     width: '100%',
     paddingVertical: 22,
@@ -648,7 +955,7 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
     textAlign: 'center',
   },
-  cardScroll: { padding: 16 },
+  cardScroll: { padding: 16, gap: 16 },
   card: {
     backgroundColor: '#fff',
     borderRadius: 16,
@@ -683,6 +990,20 @@ const styles = StyleSheet.create({
   },
   mutedText: { fontSize: 14, color: '#9CA3AF', fontStyle: 'italic' },
 
+  // Checks panel
+  checkRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    paddingVertical: 8,
+    gap: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#F3F4F6',
+  },
+  checkIcon: { fontSize: 22, fontWeight: '900', width: 26, textAlign: 'center' },
+  checkTextCol: { flex: 1 },
+  checkTitle: { fontSize: 16, fontWeight: '700', color: '#111827' },
+  checkSummary: { fontSize: 13, color: '#6B7280', marginTop: 1 },
+
   calloutBox: { borderWidth: 1.5, borderRadius: 12, padding: 12, marginTop: 14, gap: 3 },
   calloutTitle: { fontSize: 14, fontWeight: '700', marginBottom: 2 },
   calloutItem: { fontSize: 14, color: '#374151', lineHeight: 20 },
@@ -692,6 +1013,26 @@ const styles = StyleSheet.create({
   missingTitle: { color: '#B45309' },
 
   reasonText: { fontSize: 14, color: '#6B7280', marginTop: 16, lineHeight: 20 },
+
+  // Details toggle
+  detailsToggle: { marginTop: 16, paddingVertical: 8 },
+  detailsToggleText: { fontSize: 15, fontWeight: '700', color: '#0a7ea4' },
+  detailsBox: {
+    marginTop: 4,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: '#F9FAFB',
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+  },
+  detailsHeading: { fontSize: 13, fontWeight: '700', color: '#374151' },
+  detailsMono: {
+    fontSize: 12,
+    fontFamily: MONO,
+    color: '#4B5563',
+    marginTop: 4,
+    lineHeight: 18,
+  },
 
   // Error view
   errorRoot: {
