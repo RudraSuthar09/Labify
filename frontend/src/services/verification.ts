@@ -6,8 +6,6 @@
  * Returns the backend's structured pass/fail/warning result, or throws a
  * {@link VerificationCallError} carrying a typed, user-presentable reason.
  */
-import axios, { AxiosError } from 'axios';
-
 import env from '../config/env';
 import type {
   VerificationResult,
@@ -19,10 +17,18 @@ interface BackendErrorBody {
   error?: { status?: number; message?: string };
 }
 
+// 45s timeout accommodates the Render free-tier cold start (the service sleeps
+// after ~15 min idle and can take 30s+ to wake on the first request).
+const REQUEST_TIMEOUT_MS = 45000;
+
+// Health checks are user-initiated from the Settings screen; the operator is
+// staring at a spinner, so a shorter timeout gives faster feedback while still
+// covering a cold start.
+const HEALTH_CHECK_TIMEOUT_MS = 30000;
+
 /**
  * Error thrown by {@link verifyLabel}. Carries a categorised
- * {@link VerificationError} so the UI can render a clean message + retry without
- * inspecting axios internals.
+ * {@link VerificationError} so the UI can render a clean message + retry.
  */
 export class VerificationCallError extends Error {
   readonly info: VerificationError;
@@ -36,20 +42,6 @@ export class VerificationCallError extends Error {
   }
 }
 
-// One axios instance for all verification calls. 45s timeout accommodates the
-// Render free-tier cold start (the service sleeps after ~15 min idle and can
-// take 30s+ to wake on the first request).
-const client = axios.create({
-  baseURL: env.apiBaseUrl,
-  timeout: 45000,
-  headers: {
-    // React Native appends the correct `boundary=...` to this for FormData
-    // bodies; the multer backend needs that to parse the multipart upload.
-    'Content-Type': 'multipart/form-data',
-    Accept: 'application/json',
-  },
-});
-
 /** Pull the backend's human-readable message out of an error response, if any. */
 function serverMessage(data: unknown): string | undefined {
   if (data && typeof data === 'object') {
@@ -59,42 +51,6 @@ function serverMessage(data: unknown): string | undefined {
     }
   }
   return undefined;
-}
-
-/** Map any thrown error to a categorised, user-presentable VerificationError. */
-function toVerificationError(err: unknown): VerificationError {
-  if (axios.isAxiosError(err)) {
-    const axErr = err as AxiosError;
-
-    // Request aborted due to the configured timeout.
-    if (axErr.code === 'ECONNABORTED') {
-      return {
-        kind: 'timeout',
-        message:
-          'Server took too long to respond. The server may be waking up — try again.',
-      };
-    }
-
-    // A response came back with a non-2xx status.
-    if (axErr.response) {
-      return {
-        kind: 'server',
-        message:
-          serverMessage(axErr.response.data) ?? 'Server error. Please try again.',
-      };
-    }
-
-    // Request was made but no response (DNS failure, no internet, host down).
-    return {
-      kind: 'network',
-      message: 'No connection to the server. Check your internet and try again.',
-    };
-  }
-
-  return {
-    kind: 'unknown',
-    message: 'Something went wrong. Please try again.',
-  };
 }
 
 /**
@@ -133,12 +89,137 @@ export async function verifyLabel(
   form.append('barcodeValue', barcodeValue);
   form.append('labelType', 'battery_pack');
 
+  // Use React Native's native fetch — not axios. RN sets the multipart
+  // `Content-Type: multipart/form-data; boundary=...` header itself when the
+  // body is a FormData with a file object; axios's pre-set Content-Type
+  // clobbers the boundary and Android drops the request as malformed.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  let res: Response;
   try {
-    const { data } = await client.post<VerificationResult>('/api/verify', form);
-    return data;
+    res = await fetch(env.apiBaseUrl + '/api/verify', {
+      method: 'POST',
+      body: form,
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
   } catch (err) {
-    throw new VerificationCallError(toVerificationError(err));
+    clearTimeout(timer);
+    if ((err as { name?: string }).name === 'AbortError') {
+      throw new VerificationCallError({
+        kind: 'timeout',
+        message:
+          'Server took too long to respond. The server may be waking up — try again.',
+      });
+    }
+    throw new VerificationCallError({
+      kind: 'network',
+      message: 'No connection to the server. Check your internet and try again.',
+    });
   }
+  clearTimeout(timer);
+
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new VerificationCallError({
+      kind: 'server',
+      message: 'Server returned an invalid response. Please try again.',
+    });
+  }
+
+  if (!res.ok) {
+    throw new VerificationCallError({
+      kind: 'server',
+      message: serverMessage(body) ?? 'Server error. Please try again.',
+    });
+  }
+
+  return body as VerificationResult;
+}
+
+/**
+ * Result of a manual "test connection" ping from the Settings screen.
+ * Distinct from {@link VerificationError} because the success shape carries
+ * observable data (round-trip latency, server timestamp) that we want to show
+ * even on a healthy response.
+ */
+export type HealthCheckResult =
+  | { ok: true; latencyMs: number; timestamp: string | null }
+  | { ok: false; error: VerificationError };
+
+/**
+ * Ping the backend's `/health` endpoint. Never throws — the failure shape is
+ * part of the return type so the caller can render a categorised message
+ * without a try/catch.
+ */
+export async function pingBackend(): Promise<HealthCheckResult> {
+  if (!env.apiConfigured) {
+    return {
+      ok: false,
+      error: {
+        kind: 'unknown',
+        message: 'App is not configured with a backend URL (API_BASE_URL is missing).',
+      },
+    };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
+  const started = Date.now();
+
+  let res: Response;
+  try {
+    res = await fetch(env.apiBaseUrl + '/health', {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if ((err as { name?: string }).name === 'AbortError') {
+      return {
+        ok: false,
+        error: {
+          kind: 'timeout',
+          message: 'Health check timed out. The server may be waking up — try again.',
+        },
+      };
+    }
+    return {
+      ok: false,
+      error: {
+        kind: 'network',
+        message: 'Could not reach the server. Check the URL and your internet connection.',
+      },
+    };
+  }
+  clearTimeout(timer);
+  const latencyMs = Date.now() - started;
+
+  if (!res.ok) {
+    return {
+      ok: false,
+      error: {
+        kind: 'server',
+        message: `Server responded with HTTP ${res.status}.`,
+      },
+    };
+  }
+
+  // Best-effort parse of `{ status, timestamp }`. A malformed body still counts
+  // as "reachable" — we just skip the timestamp.
+  let timestamp: string | null = null;
+  try {
+    const body = (await res.json()) as { timestamp?: unknown };
+    if (typeof body.timestamp === 'string') timestamp = body.timestamp;
+  } catch {
+    // Non-JSON but 2xx — still reachable. Leave timestamp null.
+  }
+
+  return { ok: true, latencyMs, timestamp };
 }
 
 export default verifyLabel;

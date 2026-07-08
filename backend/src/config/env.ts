@@ -41,6 +41,13 @@ const EnvSchema = z
     // Placeholder for later — accepted but not yet used.
     DATABASE_URL: z.string().optional(),
 
+    // Supabase Storage — used to persist every scanned label photo for audit.
+    // All three are optional: if URL or service key is missing, storage is
+    // disabled (verification still succeeds; imageUrl is null in the response).
+    SUPABASE_URL: z.string().url().optional().or(z.literal('').transform(() => undefined)),
+    SUPABASE_SERVICE_KEY: z.string().optional(),
+    SUPABASE_STORAGE_BUCKET: z.string().default('label-scans'),
+
     // Comma-separated origins → string[]. Empty string means "no origins".
     ALLOWED_ORIGINS: z
       .string()

@@ -46,6 +46,11 @@ export interface VerificationResult {
   ocrText: string;
   /** Human-readable explanation aimed at the operator. */
   reason: string;
+  /**
+   * Public URL of the archived scan photo, or null when storage is disabled or
+   * the upload failed (a storage error never blocks verification).
+   */
+  imageUrl: string | null;
 }
 
 export interface VerifyLabelInput {
@@ -118,6 +123,7 @@ export function verifyLabel({
       missingFields: [],
       ocrText,
       reason: `Unknown label type "${labelType}".`,
+      imageUrl: null,
     };
   }
 
@@ -144,6 +150,7 @@ export function verifyLabel({
       reason:
         `Could not read the ${profile.barcodeField} from the label, so the ` +
         `scanned barcode "${barcodeValue}" cannot be verified.${missingNote}`,
+      imageUrl: null,
     };
   }
 
@@ -165,6 +172,7 @@ export function verifyLabel({
       reason:
         `Barcode matches the ${profile.barcodeField} on the label ` +
         `(${normalize(expectedRaw)}).${missingNote}`,
+      imageUrl: null,
     };
   }
 
@@ -195,6 +203,7 @@ export function verifyLabel({
         `Barcode "${barcodeValue}" is very close to the label's ` +
         `${profile.barcodeField} "${expectedRaw}" but not identical — likely ` +
         `an OCR misread.${diffNote} Please verify manually.${missingNote}`,
+      imageUrl: null,
     };
   }
 
@@ -211,5 +220,6 @@ export function verifyLabel({
       `Barcode "${barcodeValue}" does not match the label's ` +
       `${profile.barcodeField} "${expectedRaw}" ` +
       `(edit distance ${comparison.distance}).${missingNote}`,
+    imageUrl: null,
   };
 }

@@ -20,6 +20,8 @@ export type VerificationResult = {
   missingFields: string[];
   ocrText: string;
   reason: string;
+  /** Public URL of the archived scan photo, or null when storage is disabled/failed. */
+  imageUrl: string | null;
 };
 
 /** Categorised, user-presentable failure of the verification *call* itself. */

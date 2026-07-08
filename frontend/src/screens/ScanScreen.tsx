@@ -19,12 +19,14 @@ import {
 } from 'expo-camera';
 
 import { verifyLabel, VerificationCallError } from '../services/verification';
+import { enqueue } from '../services/offlineQueue';
 import type {
   VerificationResult,
   VerificationError,
   VerificationStatus,
 } from '../types/verification';
 import { useResultFeedback } from '../hooks/useResultFeedback';
+import { usePendingSync } from '../hooks/usePendingSync';
 import { extractRsn } from '../utils/barcode';
 
 // Barcode formats we care about on battery-pack labels.
@@ -50,13 +52,14 @@ const BANNER: Record<VerificationStatus, { bg: string; label: string }> = {
   warning: { bg: '#F59E0B', label: 'WARNING · Review Required' },
 };
 
-type Phase = 'idle' | 'capturing' | 'verifying' | 'success' | 'error';
+type Phase = 'idle' | 'capturing' | 'verifying' | 'success' | 'queued' | 'error';
 
 export default function ScanScreen() {
   const navigation = useNavigation();
   const [permission, requestPermission] = useCameraPermissions();
   const cameraRef = useRef<CameraView>(null);
   const playFeedback = useResultFeedback();
+  const { count: pendingCount } = usePendingSync();
 
   const [phase, setPhase] = useState<Phase>('idle');
   const [result, setResult] = useState<VerificationResult | null>(null);
@@ -79,21 +82,44 @@ export default function ScanScreen() {
     soundRef.current = soundEnabled;
   }, [soundEnabled]);
 
-  // Header sound toggle (the only setting for now).
+  // Header actions: pending-sync badge (only when > 0) + sound toggle + settings
+  // shortcut. `navigation.navigate` bubbles up from the tab navigator to the
+  // root stack, so 'Settings' resolves even though it lives on a different
+  // navigator.
   useLayoutEffect(() => {
     navigation.setOptions({
       headerRight: () => (
-        <Pressable
-          onPress={() => setSoundEnabled((v) => !v)}
-          hitSlop={12}
-          accessibilityLabel={soundEnabled ? 'Mute result sounds' : 'Unmute result sounds'}
-          style={styles.headerButton}
-        >
-          <Text style={styles.headerIcon}>{soundEnabled ? '🔊' : '🔇'}</Text>
-        </Pressable>
+        <View style={styles.headerActions}>
+          {pendingCount > 0 ? (
+            <Pressable
+              onPress={() => navigation.navigate('Settings')}
+              hitSlop={12}
+              accessibilityLabel={`${pendingCount} scans pending sync`}
+              style={styles.pendingBadge}
+            >
+              <Text style={styles.pendingBadgeText}>↑ {pendingCount}</Text>
+            </Pressable>
+          ) : null}
+          <Pressable
+            onPress={() => setSoundEnabled((v) => !v)}
+            hitSlop={12}
+            accessibilityLabel={soundEnabled ? 'Mute result sounds' : 'Unmute result sounds'}
+            style={styles.headerButton}
+          >
+            <Text style={styles.headerIcon}>{soundEnabled ? '🔊' : '🔇'}</Text>
+          </Pressable>
+          <Pressable
+            onPress={() => navigation.navigate('Settings')}
+            hitSlop={12}
+            accessibilityLabel="Open settings"
+            style={styles.headerButton}
+          >
+            <Text style={styles.headerIcon}>⚙️</Text>
+          </Pressable>
+        </View>
       ),
     });
-  }, [navigation, soundEnabled]);
+  }, [navigation, soundEnabled, pendingCount]);
 
   const resetToIdle = useCallback(() => {
     genRef.current += 1; // invalidate anything in flight
@@ -123,9 +149,29 @@ export default function ScanScreen() {
           e instanceof VerificationCallError
             ? e.info
             : { kind: 'unknown', message: 'Something went wrong. Please try again.' };
-        setError(info);
-        setResult(null);
-        setPhase('error');
+
+        // Never lose a scan — persist to the offline queue so it retries when
+        // connectivity comes back. The only case where we can't queue is when
+        // the camera never produced a usable image; then there's nothing worth
+        // saving and we show the raw error instead.
+        const enqueued = await enqueue({
+          barcodeValue: barcode,
+          labelType: 'battery_pack',
+          imageUri,
+          cause: info,
+        });
+        if (gen !== genRef.current) return;
+
+        if (enqueued.ok) {
+          setResult(null);
+          setError(info); // kept so the QueuedView can show "why" it was queued
+          setPhase('queued');
+        } else {
+          // No image to queue — surface the error and let the operator rescan.
+          setError(info);
+          setResult(null);
+          setPhase('error');
+        }
       }
     },
     [playFeedback],
@@ -155,11 +201,26 @@ export default function ScanScreen() {
       setError(null);
       setPhase('capturing');
 
+      // Yield one frame so the CameraView finishes handling the barcode scan
+      // before we ask it to capture a still — on Android, calling
+      // takePictureAsync inside onBarcodeScanned races the scanner and throws
+      // "Failed to capture image".
+      await new Promise((r) => setTimeout(r, 350));
+
       let imageUri = '';
-      try {
+      const takeOnce = async () => {
         // No skipProcessing — we want a correctly EXIF-oriented image so OCR
         // reads the label the right way up (matters on iOS).
-        const photo = await cameraRef.current?.takePictureAsync({ quality: 0.6 });
+        return cameraRef.current?.takePictureAsync({ quality: 0.6 });
+      };
+      try {
+        let photo = await takeOnce();
+        if (!photo?.uri) {
+          // Android sometimes needs autofocus to settle after the scan frame
+          // before it will hand us a still — one retry with a longer wait.
+          await new Promise((r) => setTimeout(r, 500));
+          photo = await takeOnce();
+        }
         imageUri = photo?.uri ?? '';
       } catch {
         // Non-fatal: the verify call will surface a clear error if the image
@@ -257,6 +318,15 @@ export default function ScanScreen() {
 
       {phase === 'success' && result && (
         <ResultView result={result} onScanNext={resetToIdle} />
+      )}
+
+      {phase === 'queued' && (
+        <QueuedView
+          barcode={pendingBarcode}
+          cause={error}
+          onScanNext={resetToIdle}
+          onOpenSettings={() => navigation.navigate('Settings')}
+        />
       )}
 
       {phase === 'error' && error && (
@@ -391,6 +461,57 @@ function ResultView({
   );
 }
 
+// --- Queued view (verification failed but scan is safe in the offline queue) -
+
+function QueuedView({
+  barcode,
+  cause,
+  onScanNext,
+  onOpenSettings,
+}: {
+  barcode: string;
+  cause: VerificationError | null;
+  onScanNext: () => void;
+  onOpenSettings: () => void;
+}) {
+  const humanReason =
+    cause?.kind === 'network' || cause?.kind === 'timeout'
+      ? 'You’re offline. This scan is safe on the device and will verify automatically when you’re back on the network.'
+      : 'The server couldn’t verify this scan just now. It’s safe on the device and will retry automatically.';
+  return (
+    <SafeAreaView style={styles.queuedRoot} edges={['top', 'bottom']}>
+      <View style={styles.queuedBanner}>
+        <Text style={styles.bannerText}>QUEUED · Will verify later</Text>
+      </View>
+      <ScrollView contentContainerStyle={styles.cardScroll}>
+        <View style={styles.card}>
+          <Text style={styles.fieldLabel}>Scanned Barcode</Text>
+          <Text style={styles.serialLarge} numberOfLines={2} selectable>
+            {barcode || '—'}
+          </Text>
+
+          <View style={styles.divider} />
+
+          <Text style={styles.reasonText}>{humanReason}</Text>
+        </View>
+      </ScrollView>
+      <View style={styles.footer}>
+        <Pressable style={styles.primaryButton} onPress={onScanNext}>
+          <Text style={styles.primaryButtonText}>Scan Next</Text>
+        </Pressable>
+        <Pressable
+          style={[styles.secondaryButton, styles.secondaryButtonOnLight]}
+          onPress={onOpenSettings}
+        >
+          <Text style={[styles.secondaryButtonText, styles.secondaryButtonTextOnLight]}>
+            View queue
+          </Text>
+        </Pressable>
+      </View>
+    </SafeAreaView>
+  );
+}
+
 // --- Error view --------------------------------------------------------------
 
 function ErrorView({
@@ -436,8 +557,17 @@ const styles = StyleSheet.create({
     padding: 24,
   },
 
-  headerButton: { paddingHorizontal: 12, paddingVertical: 4 },
+  headerActions: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  headerButton: { paddingHorizontal: 10, paddingVertical: 4 },
   headerIcon: { fontSize: 20 },
+  pendingBadge: {
+    backgroundColor: '#F59E0B',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    marginRight: 4,
+  },
+  pendingBadgeText: { color: '#fff', fontSize: 12, fontWeight: '800' },
 
   // Permission message
   messageBox: { alignItems: 'center', gap: 16, maxWidth: 360 },
@@ -491,6 +621,16 @@ const styles = StyleSheet.create({
     fontFamily: MONO,
     textAlign: 'center',
     opacity: 0.9,
+  },
+
+  // Queued view (offline / server-hiccup safe state)
+  queuedRoot: { ...StyleSheet.absoluteFillObject, backgroundColor: '#F3F4F6' },
+  queuedBanner: {
+    width: '100%',
+    paddingVertical: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#0369A1', // slate/blue: distinct from pass/fail/warn
   },
 
   // Result view

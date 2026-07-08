@@ -12,6 +12,7 @@ import { logger } from './utils/logger';
 import { corsMiddleware } from './middleware/cors';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { healthRouter } from './routes/health';
+import { scansRouter } from './routes/scans';
 import { verifyRouter } from './routes/verify';
 
 const app = express();
@@ -31,6 +32,7 @@ app.use(express.urlencoded({ extended: true }));
 // Routes
 app.use(healthRouter);
 app.use(verifyRouter);
+app.use(scansRouter);
 
 // 404 for anything unmatched, then the JSON error handler (must be last).
 app.use(notFoundHandler);

@@ -8,15 +8,19 @@
  * A dev-only POST /api/verify/debug variant additionally returns the raw OCR
  * response, for tuning the label-profile regexes.
  */
+import { randomUUID } from 'node:crypto';
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import multer, { MulterError } from 'multer';
 import rateLimit from 'express-rate-limit';
+import sharp from 'sharp';
 import { z } from 'zod';
 
 import { env, isDev } from '../config/env';
 import { HttpError } from '../utils/httpError';
 import { logger } from '../utils/logger';
 import { runOcr } from '../services/ocr';
+import { getScanStore } from '../services/scanStore';
+import { getStorageProvider } from '../services/storage';
 import { verifyLabel } from '../services/verification';
 import { KNOWN_LABEL_TYPES, DEFAULT_LABEL_TYPE } from '../config/labelProfiles';
 
@@ -103,6 +107,59 @@ const VerifyBodySchema = z.object({
 });
 
 /**
+ * Build the object-store path for one scan. Date-partitioned so listings and
+ * lifecycle rules can operate on YYYY/MM/DD prefixes.
+ */
+function buildScanFilename(now: Date = new Date()): string {
+  const yyyy = now.getUTCFullYear();
+  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(now.getUTCDate()).padStart(2, '0');
+  return `scans/${yyyy}/${mm}/${dd}/${randomUUID()}.jpg`;
+}
+
+/**
+ * Re-encode the uploaded photo before archiving: rotate from EXIF, cap at
+ * 1600 px wide, and emit JPEG q80. Keeps storage costs sane. Falls back to the
+ * original buffer if sharp fails (rare) — the archive still runs.
+ */
+async function compressForStorage(buffer: Buffer): Promise<Buffer> {
+  try {
+    return await sharp(buffer)
+      .rotate()
+      .resize({ width: 1600, withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+  } catch (err) {
+    logger.warn({ err }, 'Image compression failed — archiving original buffer');
+    return buffer;
+  }
+}
+
+/**
+ * Upload the scan to the configured storage provider. Returns the public URL,
+ * or null when storage is disabled or the upload failed — a storage failure
+ * must never block verification, so callers can safely ignore null.
+ */
+async function archiveScanImage(buffer: Buffer): Promise<string | null> {
+  const storage = getStorageProvider();
+  if (!storage) return null;
+
+  const filename = buildScanFilename();
+  try {
+    const compressed = await compressForStorage(buffer);
+    const url = await storage.uploadImage(compressed, filename);
+    logger.debug({ filename, provider: storage.name }, 'Scan image archived');
+    return url;
+  } catch (err) {
+    logger.error(
+      { err, filename, provider: storage.name },
+      'Failed to archive scan image — verification will still complete',
+    );
+    return null;
+  }
+}
+
+/**
  * Shared handler for both the public and debug endpoints. Returns the OCR raw
  * payload alongside the result when `includeRaw` is set.
  */
@@ -130,35 +187,66 @@ async function runVerification(
     throw new HttpError(400, 'No image uploaded — attach the label photo in the "image" field.');
   }
 
-  // 3. OCR the image. A failure here is an upstream/service problem, not a bad
-  //    request, so it becomes a 502 (handled in catch below).
+  // 3. OCR the image and archive it in parallel. OCR failure is a 502; storage
+  //    failure only nulls out imageUrl — it never blocks verification.
   const ocrStart = Date.now();
-  let ocrText: string;
-  let ocrRaw: unknown;
-  try {
-    const result = await runOcr(req.file.buffer);
-    ocrText = result.text;
-    ocrRaw = result.raw;
-  } catch (err) {
-    logger.error({ err, barcodeValue }, 'OCR provider failed');
+  const [ocrSettled, imageUrl] = await Promise.all([
+    runOcr(req.file.buffer).then(
+      (r) => ({ ok: true as const, result: r }),
+      (err: unknown) => ({ ok: false as const, err }),
+    ),
+    archiveScanImage(req.file.buffer),
+  ]);
+  const ocrDurationMs = Date.now() - ocrStart;
+
+  if (!ocrSettled.ok) {
+    logger.error({ err: ocrSettled.err, barcodeValue }, 'OCR provider failed');
     throw new HttpError(
       502,
       'OCR service is currently unavailable. Please try again shortly.',
     );
   }
-  const ocrDurationMs = Date.now() - ocrStart;
+  const { text: ocrText, raw: ocrRaw } = ocrSettled.result;
 
-  // 4. Compare barcode vs label serial.
-  const verification = verifyLabel({ barcodeValue, ocrText, labelType });
+  // 4. Compare barcode vs label serial, then stamp the archive URL onto it.
+  const verification = { ...verifyLabel({ barcodeValue, ocrText, labelType }), imageUrl };
+
+  // 5. Persist to the audit log. Blocking (not fire-and-forget) so a scan is
+  //    guaranteed visible in /api/scans by the time the mobile app re-fetches
+  //    — otherwise a pull-to-refresh right after a scan can miss it. Failure to
+  //    persist is logged but never fails the response: the operator's verdict
+  //    is authoritative, and losing the audit row is preferable to blocking
+  //    the shop floor.
+  const store = getScanStore();
+  if (store) {
+    try {
+      await store.insertScan({
+        status: verification.status,
+        decodedBarcode: verification.decodedBarcode,
+        expectedValue: verification.expectedValue,
+        labelType,
+        reason: verification.reason,
+        extractedFields: verification.extractedFields,
+        mismatches: verification.mismatches,
+        missingFields: verification.missingFields,
+        ocrText: verification.ocrText,
+        imageUrl: verification.imageUrl,
+      });
+    } catch (err) {
+      logger.error({ err, barcodeValue }, 'Failed to persist scan — response unaffected');
+    }
+  }
+
   const totalDurationMs = Date.now() - totalStart;
 
-  // 5. Structured audit log for every verification (pass or fail alike).
+  // 6. Structured audit log for every verification (pass or fail alike).
   logger.info(
     {
       barcodeValue,
       labelType,
       status: verification.status,
       reason: verification.reason,
+      imageUrl,
       ocrDurationMs,
       totalDurationMs,
     },

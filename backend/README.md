@@ -16,6 +16,7 @@ Google Cloud Vision OCR) and reports whether the two agree.
 - [Quick start](#quick-start)
 - [Environment variables](#environment-variables)
 - [Setting up Google Cloud Vision](#setting-up-google-cloud-vision)
+- [Persistent image storage (Supabase)](#persistent-image-storage-supabase)
 - [API reference](#api-reference)
 - [Testing with curl](#testing-with-curl)
 - [How verification works](#how-verification-works)
@@ -71,6 +72,9 @@ cryptic runtime crash.
 | `MOCK_OCR_TEXT` | no | `""` | Text returned by the `mock` provider. |
 | `ALLOWED_ORIGINS` | no | `""` | Comma-separated CORS allowlist. Requests without an `Origin` (curl, mobile apps) are always allowed. |
 | `DATABASE_URL` | no | — | Placeholder for later; not used yet. |
+| `SUPABASE_URL` | no | — | Supabase project URL (`https://<ref>.supabase.co`). Enables persistent image archive when set alongside `SUPABASE_SERVICE_KEY`. |
+| `SUPABASE_SERVICE_KEY` | no | — | Supabase **service_role** key (Project settings → API). Server-only — never expose to the frontend. |
+| `SUPABASE_STORAGE_BUCKET` | no | `label-scans` | Bucket the scans are written into. |
 | `LOG_LEVEL` | no | `debug`(dev)/`info`(prod) | pino level override. |
 
 > **Auth note:** when `OCR_PROVIDER=google`, at least one of
@@ -139,6 +143,90 @@ You can authenticate with either a simple **API key** (fastest) or a
 
 ---
 
+## Persistent image storage (Supabase)
+
+Every scanned label photo can be archived to Supabase Storage for audit. The
+returned public URL is included in the `/api/verify` response as `imageUrl`.
+Images are re-encoded before upload (max 1600 px wide, JPEG q80) to keep the
+free tier honest.
+
+**Storage is optional.** If `SUPABASE_URL` or `SUPABASE_SERVICE_KEY` is unset,
+verification still succeeds and `imageUrl` is `null`. An upload failure at
+runtime is logged and also nulls out `imageUrl` — it never fails the request.
+
+### 1. Create a project
+
+1. Sign up / log in at [supabase.com](https://supabase.com).
+2. **New project** → pick an organisation, name it (e.g. `labify`), choose the
+   nearest region, set a strong DB password (unused here, but required).
+3. Wait for provisioning to finish.
+
+### 2. Create the storage bucket
+
+1. In the project dashboard, go to **Storage** in the left sidebar.
+2. **New bucket** → name it `label-scans` (match `SUPABASE_STORAGE_BUCKET`).
+3. Toggle **Public bucket = ON** so the returned URLs resolve without a signed
+   link. (For a private bucket, swap `getPublicUrl` for
+   `createSignedUrl(path, ttl)` in [`src/services/storage.ts`](src/services/storage.ts).)
+4. Click **Create bucket**.
+
+### 3. Grab the keys
+
+1. **Project settings → API.**
+2. Copy the **Project URL** (`https://<ref>.supabase.co`) into `SUPABASE_URL`.
+3. Copy the **`service_role` secret** into `SUPABASE_SERVICE_KEY`.
+   > ⚠️ The service_role key bypasses Row Level Security. Keep it server-side
+   > only — never ship it to the mobile app or a browser.
+
+### 4. Set the env vars
+
+```dotenv
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_KEY=eyJhbGciOi...  # service_role
+SUPABASE_STORAGE_BUCKET=label-scans
+```
+
+Restart the server. On boot you should see:
+
+```
+Image storage provider initialised { provider: 'supabase', bucket: 'label-scans' }
+```
+
+### 5. Verify it end-to-end
+
+Run a scan (see [Testing with curl](#testing-with-curl)). The response now
+contains an `imageUrl`:
+
+```jsonc
+{
+  "status": "pass",
+  "imageUrl": "https://your-project.supabase.co/storage/v1/object/public/label-scans/scans/2026/07/07/8f1b….jpg",
+  …
+}
+```
+
+Open the URL in a browser to confirm the image resolves, or check
+**Storage → label-scans → scans/YYYY/MM/DD/** in the Supabase dashboard.
+
+### Filename layout
+
+```
+scans/YYYY/MM/DD/{uuid}.jpg
+```
+
+Date-partitioned so listings and lifecycle rules (e.g. "delete after 90 days")
+can operate on `scans/2026/07/` prefixes without scanning the whole bucket. UUIDs
+avoid collisions and don't leak scan count.
+
+### Swapping storage backends
+
+The app depends only on the `StorageProvider` interface and the
+`getStorageProvider()` factory in [`src/services/storage.ts`](src/services/storage.ts).
+To move to S3, GCS, or local disk, add a class implementing `uploadImage` and
+extend the factory — the route is untouched.
+
+---
+
 ## API reference
 
 ### `POST /api/verify`
@@ -169,7 +257,9 @@ business outcome, not an HTTP error):
   "mismatches": [],                 // [{ field, expected, got }]
   "missingFields": [],              // required fields OCR couldn't read
   "ocrText": "…full OCR output…",   // for debugging
-  "reason": "Barcode matches the RSN on the label (RKBBPFM7C000167)."
+  "reason": "Barcode matches the RSN on the label (RKBBPFM7C000167).",
+  "imageUrl": "https://<ref>.supabase.co/storage/v1/object/public/label-scans/scans/2026/07/07/8f1b….jpg"
+                                    // null when Supabase storage is unconfigured or upload failed
 }
 ```
 
