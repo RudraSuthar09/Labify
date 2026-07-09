@@ -6,10 +6,12 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
+import HomeScreen from './src/screens/HomeScreen';
 import ScanScreen from './src/screens/ScanScreen';
 import HistoryScreen from './src/screens/HistoryScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
 import ScanDetailScreen from './src/screens/ScanDetailScreen';
+import BarcodeCheckScreen from './src/screens/BarcodeCheckScreen';
 import { startSyncOrchestrator } from './src/services/offlineQueue';
 import type { RootStackParamList, RootTabParamList } from './src/types/navigation';
 // Load typed env early so any missing-var warnings surface on startup.
@@ -58,13 +60,23 @@ export default function App() {
   return (
     <SafeAreaProvider>
       <NavigationContainer>
-        <Stack.Navigator>
+        <Stack.Navigator initialRouteName="Home">
+          <Stack.Screen
+            name="Home"
+            component={HomeScreen}
+            options={{ title: 'Labify', headerTitleAlign: 'center' }}
+          />
           <Stack.Screen
             name="Tabs"
             component={TabsNavigator}
             // Hide the stack header so only the tabs' per-screen headers show
             // — otherwise every tab renders two stacked headers.
             options={{ headerShown: false }}
+          />
+          <Stack.Screen
+            name="BarcodeCheck"
+            component={BarcodeCheckScreen}
+            options={{ title: 'Quick Barcode Check', headerTitleAlign: 'center' }}
           />
           <Stack.Screen
             name="Settings"

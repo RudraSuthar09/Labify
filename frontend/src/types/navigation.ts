@@ -14,7 +14,9 @@ export type RootTabParamList = {
  * pushed on top of it.
  */
 export type RootStackParamList = {
+  Home: undefined;
   Tabs: NavigatorScreenParams<RootTabParamList>;
+  BarcodeCheck: undefined;
   Settings: undefined;
   /**
    * Detail view for a single archived scan. The row payload is passed as-is —
