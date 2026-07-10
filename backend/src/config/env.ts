@@ -41,17 +41,24 @@ const EnvSchema = z
     // Placeholder for later — accepted but not yet used.
     DATABASE_URL: z.string().optional(),
 
-    // --- Supabase: scan persistence + image archive -------------------------
-    // Both URL and service key must be set to enable persistence/storage; if
-    // either is missing the app still verifies scans, just without archiving
-    // (getScanStore / getStorageProvider return undefined). The service-role key
-    // is server-only — never expose it to the frontend.
-    SUPABASE_URL: z.string().url().optional(),
-    SUPABASE_SERVICE_KEY: z.string().optional(),
-    // Storage bucket for archived label photos. Has a sensible default so only
-    // URL + key are strictly required to turn the feature on. Matches the
-    // bucket documented in .env.example.
-    SUPABASE_STORAGE_BUCKET: z.string().default('label-scans'),
+    // --- MongoDB: scan persistence (history + stats) ------------------------
+    // Set MONGODB_URI to enable persistence; if unset the app still verifies
+    // scans, just without saving them (getScanStore returns undefined and
+    // /api/scans + /api/stats return 503). Collections are created automatically
+    // on first write — no migration needed.
+    MONGODB_URI: z.string().optional(),
+    // Database name inside the cluster. Has a sensible default so only the URI
+    // is strictly required to turn persistence on.
+    MONGODB_DB: z.string().default('labify'),
+
+    // --- Cloudinary: image archive ------------------------------------------
+    // Set CLOUDINARY_URL (cloudinary://<key>:<secret>@<cloud_name>) to enable
+    // photo archiving; if unset, scans are verified/saved but imageUrl is null
+    // (the app shows an "Image not archived" placeholder). The Cloudinary SDK
+    // reads this variable itself — one line in .env is all that's required.
+    CLOUDINARY_URL: z.string().optional(),
+    // Folder to upload label photos into. Default keeps the media library tidy.
+    CLOUDINARY_FOLDER: z.string().default('labify/scans'),
 
     // --- Check C: external (Reliance/Geon) serial validation ----------------
     // The authoritative API we POST the verified serial to. Third-party and

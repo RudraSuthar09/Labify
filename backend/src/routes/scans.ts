@@ -2,7 +2,7 @@
  * GET /api/scans — paginated audit log of past verifications.
  * GET /api/stats — today's verification counts + pass rate.
  *
- * Both return 503 when the scan store isn't configured (no Supabase creds).
+ * Both return 503 when the scan store isn't configured (no MONGODB_URI).
  * The mobile app treats 503 as "history unavailable, keep scanning" rather than
  * failing hard.
  */

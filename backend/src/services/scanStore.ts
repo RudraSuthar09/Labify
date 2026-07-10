@@ -1,18 +1,18 @@
 /**
  * Scan store — the persistence layer for verified label scans.
  *
- * Backs the mobile app's HistoryScreen ({@link listScans}) and stats header
- * ({@link todayStats}), and is written to from POST /api/verify
- * ({@link insertScan}).
+ * Backs the mobile app's HistoryScreen ({@link ScanStore.listScans}) and stats
+ * header ({@link ScanStore.todayStats}), and is written to from POST /api/verify
+ * ({@link ScanStore.insertScan}).
  *
- * Uses Supabase Postgres (same project as image storage). The Supabase JS
- * service-role client bypasses RLS — it must never be exposed to the frontend.
+ * Uses MongoDB. The collection is created automatically on first write, so there
+ * is no migration to run — set MONGODB_URI and it works.
  *
- * All methods are non-throwing at the persistence layer: a database failure
- * during insert must never block verification, and a failed read is surfaced
- * via a well-typed Result. The API layer decides the HTTP mapping.
+ * All methods are non-throwing at the write path: a database failure during
+ * insert must never block verification. Reads throw a descriptive Error the API
+ * layer turns into a 500.
  */
-import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { MongoClient, ObjectId, type Collection } from 'mongodb';
 
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
@@ -21,20 +21,20 @@ import type {
   VerificationStatus,
 } from './verification';
 
-/** The Postgres row shape — snake_case, matches `db/001_init_scans.sql`. */
-interface ScanRow {
-  id: string;
-  created_at: string;
-  decoded_barcode: string;
-  expected_value: string | null;
-  label_type: string;
+/** The MongoDB document shape (camelCase, stored natively). */
+interface ScanDoc {
+  _id: ObjectId;
+  createdAt: Date;
+  decodedBarcode: string;
+  expectedValue: string | null;
+  labelType: string;
   status: VerificationStatus;
   reason: string;
-  extracted_fields: Record<string, string>;
+  extractedFields: Record<string, string>;
   mismatches: Array<{ field: string; expected: string; got: string }>;
-  missing_fields: string[];
-  ocr_text: string;
-  image_url: string | null;
+  missingFields: string[];
+  ocrText: string;
+  imageUrl: string | null;
 }
 
 /** Client-facing (camelCase) view of a persisted scan. */
@@ -61,7 +61,7 @@ export interface ListScansOptions {
    * to decode it — it's an implementation detail (base64 keyset tuple).
    */
   cursor?: string;
-  /** 1–100, defaults to 20. Clamped in {@link listScans}. */
+  /** 1–100, defaults to 20. Clamped in {@link ScanStore.listScans}. */
   limit?: number;
 }
 
@@ -82,7 +82,7 @@ export interface TodayStats {
   passRate: number | null;
 }
 
-/** Input for {@link insertScan}: what /api/verify already computed. */
+/** Input for {@link ScanStore.insertScan}: what /api/verify already computed. */
 export interface InsertScanInput
   extends Pick<
     VerificationResult,
@@ -105,9 +105,9 @@ export interface ScanStore {
   todayStats(): Promise<TodayStats>;
 }
 
-// --- Implementation ---------------------------------------------------------
+// --- Helpers ----------------------------------------------------------------
 
-const TABLE = 'scans';
+const COLLECTION = 'scans';
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 
@@ -129,150 +129,160 @@ function decodeCursor(cursor: string): { ts: string; id: string } | null {
   }
 }
 
-function rowToScan(row: ScanRow): StoredScan {
+/** Compact, human-readable description of a driver error for the API response. */
+function describeDbError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return 'unknown database error';
+}
+
+function docToScan(doc: ScanDoc): StoredScan {
   return {
-    id: row.id,
-    createdAt: row.created_at,
-    decodedBarcode: row.decoded_barcode,
-    expectedValue: row.expected_value,
-    labelType: row.label_type,
-    status: row.status,
-    reason: row.reason,
-    extractedFields: row.extracted_fields ?? {},
-    mismatches: row.mismatches ?? [],
-    missingFields: row.missing_fields ?? [],
-    ocrText: row.ocr_text ?? '',
-    imageUrl: row.image_url,
+    id: doc._id.toHexString(),
+    createdAt: doc.createdAt.toISOString(),
+    decodedBarcode: doc.decodedBarcode ?? '',
+    expectedValue: doc.expectedValue ?? null,
+    labelType: doc.labelType,
+    status: doc.status,
+    reason: doc.reason,
+    extractedFields: doc.extractedFields ?? {},
+    mismatches: doc.mismatches ?? [],
+    missingFields: doc.missingFields ?? [],
+    ocrText: doc.ocrText ?? '',
+    imageUrl: doc.imageUrl ?? null,
   };
 }
 
-class SupabaseScanStore implements ScanStore {
-  private readonly client: SupabaseClient;
+// --- Implementation ---------------------------------------------------------
 
-  constructor(url: string, serviceKey: string) {
-    this.client = createClient(url, serviceKey, {
-      auth: { persistSession: false, autoRefreshToken: false },
+class MongoScanStore implements ScanStore {
+  private readonly client: MongoClient;
+  /** Resolves to the ready collection (connected + indexes ensured). */
+  private readonly ready: Promise<Collection<ScanDoc>>;
+
+  constructor(uri: string, dbName: string) {
+    this.client = new MongoClient(uri);
+    this.ready = this.client.connect().then((c) => {
+      const col = c.db(dbName).collection<ScanDoc>(COLLECTION);
+      // Match the browse orderings the queries rely on. Idempotent; safe to call
+      // on every boot. Failures here are non-fatal — Mongo will still serve
+      // (unindexed) queries, so we log and continue.
+      void col
+        .createIndexes([
+          { key: { createdAt: -1, _id: -1 } },
+          { key: { status: 1, createdAt: -1, _id: -1 } },
+        ])
+        .catch((err) => logger.warn({ err }, 'Failed to ensure scan indexes'));
+      logger.info({ db: dbName, collection: COLLECTION }, 'Mongo scan store connected');
+      return col;
     });
   }
 
   async insertScan(input: InsertScanInput): Promise<StoredScan | null> {
-    const row = {
-      decoded_barcode: input.decodedBarcode,
-      expected_value: input.expectedValue,
-      label_type: input.labelType,
-      status: input.status,
-      reason: input.reason,
-      extracted_fields: input.extractedFields,
-      mismatches: input.mismatches,
-      missing_fields: input.missingFields,
-      ocr_text: input.ocrText,
-      image_url: input.imageUrl,
-    };
-
-    const { data, error } = await this.client
-      .from(TABLE)
-      .insert(row)
-      .select('*')
-      .single<ScanRow>();
-
-    if (error) {
-      logger.error({ err: error }, 'Failed to persist scan — verification response is unaffected');
+    try {
+      const col = await this.ready;
+      const doc: Omit<ScanDoc, '_id'> = {
+        createdAt: new Date(),
+        // QR-only scans have a null barcode; store '' so the column is always a
+        // string for the list UI.
+        decodedBarcode: input.decodedBarcode ?? '',
+        expectedValue: input.expectedValue,
+        labelType: input.labelType,
+        status: input.status,
+        reason: input.reason,
+        extractedFields: input.extractedFields,
+        mismatches: input.mismatches,
+        missingFields: input.missingFields,
+        ocrText: input.ocrText,
+        imageUrl: input.imageUrl,
+      };
+      const res = await col.insertOne(doc as ScanDoc);
+      return docToScan({ ...(doc as ScanDoc), _id: res.insertedId });
+    } catch (err) {
+      logger.error({ err }, 'Failed to persist scan — verification response is unaffected');
       return null;
     }
-    return rowToScan(data);
   }
 
   async listScans(options: ListScansOptions): Promise<ScanPage> {
-    const limit = Math.min(
-      Math.max(1, options.limit ?? DEFAULT_LIMIT),
-      MAX_LIMIT,
-    );
+    const limit = Math.min(Math.max(1, options.limit ?? DEFAULT_LIMIT), MAX_LIMIT);
 
-    let query = this.client
-      .from(TABLE)
-      .select('*')
-      // Descending on (created_at, id) — same order the composite index provides.
-      .order('created_at', { ascending: false })
-      .order('id', { ascending: false })
-      // Ask for one extra row so we can tell whether a next page exists without a
-      // second COUNT(*) query.
-      .limit(limit + 1);
+    // Base filter: optional status.
+    const filter: Record<string, unknown> = {};
+    if (options.status) filter.status = options.status;
 
-    if (options.status) {
-      query = query.eq('status', options.status);
-    }
-
+    // Keyset pagination on (createdAt desc, _id desc): everything strictly
+    // "older" than the cursor tuple.
     if (options.cursor) {
       const decoded = decodeCursor(options.cursor);
-      if (decoded) {
-        // Keyset: (created_at, id) < (ts, id). PostgREST expresses tuple compare
-        // via .or() with a nested .and().
-        query = query.or(
-          `created_at.lt.${decoded.ts},and(created_at.eq.${decoded.ts},id.lt.${decoded.id})`,
-        );
+      if (decoded && ObjectId.isValid(decoded.id)) {
+        const ts = new Date(decoded.ts);
+        const oid = new ObjectId(decoded.id);
+        filter.$or = [
+          { createdAt: { $lt: ts } },
+          { createdAt: ts, _id: { $lt: oid } },
+        ];
       }
-      // Malformed cursor → ignore, treat as first page. Defensive; the client
-      // should not have produced it.
+      // Malformed cursor → ignore, treat as first page.
     }
 
-    const { data, error } = await query.returns<ScanRow[]>();
-    if (error) {
-      logger.error({ err: error }, 'Failed to read scans');
-      throw new Error('Failed to read scans');
+    try {
+      const col = await this.ready;
+      // Fetch one extra to detect a next page without a separate count.
+      const rows = await col
+        .find(filter)
+        .sort({ createdAt: -1, _id: -1 })
+        .limit(limit + 1)
+        .toArray();
+
+      const hasMore = rows.length > limit;
+      const pageRows = hasMore ? rows.slice(0, limit) : rows;
+      const items = pageRows.map(docToScan);
+      const last = pageRows[pageRows.length - 1];
+      const nextCursor =
+        hasMore && last
+          ? encodeCursor(last.createdAt.toISOString(), last._id.toHexString())
+          : null;
+
+      return { items, nextCursor };
+    } catch (err) {
+      logger.error({ err }, 'Failed to read scans');
+      throw new Error(`Failed to read scans: ${describeDbError(err)}`);
     }
-
-    const rows = data ?? [];
-    const hasMore = rows.length > limit;
-    const pageRows = hasMore ? rows.slice(0, limit) : rows;
-    const items = pageRows.map(rowToScan);
-    const last = pageRows[pageRows.length - 1];
-    // Normalise to `...Z` form so the cursor value never contains a `+` that
-    // PostgREST's URL parser would decode as a space. Both forms represent the
-    // same instant; the DB stores UTC internally.
-    const nextCursor =
-      hasMore && last
-        ? encodeCursor(new Date(last.created_at).toISOString(), last.id)
-        : null;
-
-    return { items, nextCursor };
   }
 
   async todayStats(): Promise<TodayStats> {
-    // "Today" is UTC — the same clock the DB uses for now(), so this matches
-    // what a NOW-based dashboard would show. Callers that need per-timezone
-    // buckets will add a query param later.
+    // "Today" is UTC — the same clock the DB uses for insert timestamps.
     const now = new Date();
     const startOfDay = new Date(
       Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
     );
     const dateIso = startOfDay.toISOString().slice(0, 10); // YYYY-MM-DD
 
-    // Small select — status column only, filtered by day. Aggregating in JS
-    // keeps this a single index-covered scan on the composite index and
-    // avoids Postgres GROUP BY over the JSONB columns.
-    const { data, error } = await this.client
-      .from(TABLE)
-      .select('status')
-      .gte('created_at', startOfDay.toISOString())
-      .returns<Array<{ status: VerificationStatus }>>();
+    try {
+      const col = await this.ready;
+      const grouped = await col
+        .aggregate<{ _id: VerificationStatus; n: number }>([
+          { $match: { createdAt: { $gte: startOfDay } } },
+          { $group: { _id: '$status', n: { $sum: 1 } } },
+        ])
+        .toArray();
 
-    if (error) {
-      logger.error({ err: error }, 'Failed to read daily stats');
-      throw new Error('Failed to read daily stats');
+      let pass = 0;
+      let fail = 0;
+      let warning = 0;
+      for (const g of grouped) {
+        if (g._id === 'pass') pass = g.n;
+        else if (g._id === 'fail') fail = g.n;
+        else if (g._id === 'warning') warning = g.n;
+      }
+      const total = pass + fail + warning;
+      const passRate = total === 0 ? null : pass / total;
+
+      return { date: dateIso, total, pass, fail, warning, passRate };
+    } catch (err) {
+      logger.error({ err }, 'Failed to read daily stats');
+      throw new Error(`Failed to read daily stats: ${describeDbError(err)}`);
     }
-
-    let pass = 0;
-    let fail = 0;
-    let warning = 0;
-    for (const row of data ?? []) {
-      if (row.status === 'pass') pass += 1;
-      else if (row.status === 'fail') fail += 1;
-      else if (row.status === 'warning') warning += 1;
-    }
-    const total = pass + fail + warning;
-    const passRate = total === 0 ? null : pass / total;
-
-    return { date: dateIso, total, pass, fail, warning, passRate };
   }
 }
 
@@ -283,8 +293,8 @@ let resolved = false;
 
 /**
  * The configured scan store, or `undefined` when persistence is not enabled
- * (missing SUPABASE_URL / SUPABASE_SERVICE_KEY). Matches the storage.ts
- * factory pattern so callers can degrade the same way.
+ * (missing MONGODB_URI). Matches the storage.ts factory pattern so callers can
+ * degrade the same way.
  *
  * Callers must handle `undefined`:
  *   - /api/verify: log a warn and skip persistence.
@@ -295,16 +305,16 @@ export function getScanStore(): ScanStore | undefined {
   if (resolved) return cached;
   resolved = true;
 
-  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) {
+  if (!env.MONGODB_URI) {
     logger.info(
-      'Scan persistence is disabled (SUPABASE_URL / SUPABASE_SERVICE_KEY unset) — ' +
+      'Scan persistence is disabled (MONGODB_URI unset) — ' +
         '/api/scans and /api/stats will return 503.',
     );
     return undefined;
   }
 
-  cached = new SupabaseScanStore(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
-  logger.info('Scan store initialised');
+  cached = new MongoScanStore(env.MONGODB_URI, env.MONGODB_DB);
+  logger.info('Scan store initialised (MongoDB)');
   return cached;
 }
 
