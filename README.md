@@ -56,6 +56,93 @@ no real camera). Use Expo Go or a development build.
 > Notch / status bar are handled with `react-native-safe-area-context`; result
 > haptics use `expo-haptics` and fire on both platforms.
 
+## Deployment — shareable Android APK (EAS Build)
+
+The preview profile produces a standalone `.apk` you can send to testers as a
+download link. It bundles the JS, bakes in the backend URL, and installs without
+Expo Go.
+
+### Prerequisites
+
+- An [Expo account](https://expo.dev/signup) (free).
+- Logged in on this machine: `npx eas-cli whoami` (log in with `npx eas-cli login`).
+- **First-time only** — create the EAS project so `extra.eas.projectId` gets
+  written into `app.json`:
+
+  ```bash
+  cd frontend
+  npx eas init
+  ```
+
+  Run this once; commit the resulting `projectId` change to `app.json`.
+
+### Building a preview APK
+
+From `frontend/`:
+
+```bash
+npm run build:preview
+# equivalent to:
+npx eas build --platform android --profile preview
+```
+
+### What happens during a build
+
+1. EAS uploads your project to Expo's servers.
+2. A remote worker installs deps, runs prebuild, and compiles the APK
+   (**~10–15 minutes**; longer on first build / queue).
+3. When done, the terminal prints a **build details URL** and a **direct APK
+   download URL**. The build also appears at
+   `https://expo.dev/accounts/<account>/projects/labify/builds`.
+
+> **Env vars:** EAS remote builds do **not** read `frontend/.env`. The values the
+> app needs (`API_BASE_URL`, `OCR_PROVIDER`) are baked in via the `env` block of
+> the `preview`/`production` profiles in [`frontend/eas.json`](frontend/eas.json).
+> `API_BASE_URL` is a public URL, so it lives in `eas.json` in plaintext — no
+> `eas secret` needed. If you ever add a real secret (an API key), use
+> `npx eas secret:create` instead of putting it in `eas.json`.
+
+### Sharing the APK link
+
+- Grab the **APK download URL** from the terminal output (or from the build's
+  page on expo.dev → "Install").
+- Send testers that link. It's a direct `.apk` download — no Expo account or
+  Play Store needed on their end.
+
+### Tester install instructions (send this to your testers)
+
+1. Open the link on an **Android phone** (Chrome or any browser).
+2. Tap the download; wait for the `.apk` to finish.
+3. Open the downloaded file. If Android blocks it with *"For your security…"*:
+   **Settings → Security → Install unknown apps →** pick the browser you used →
+   enable **Allow from this source**, then reopen the APK.
+4. Tap **Install**, then **Open**.
+5. On first launch, **grant the camera permission** when prompted (required to
+   scan). If you tapped "Deny", enable it later at **Settings → Apps → Labify →
+   Permissions → Camera**.
+
+### Common issues
+
+| Symptom | Cause & fix |
+|---|---|
+| **"Network Error" / can't verify** | `API_BASE_URL` wasn't baked in. Confirm the `env` block in `eas.json`'s `preview` profile, then rebuild. |
+| **Camera doesn't work / black screen** | Permission denied. Guide the tester to **Settings → Apps → Labify → Permissions → Camera → Allow**. |
+| **First scan is very slow (~30–60s)** | Render free-tier cold start (see backend note above). Wait it out; later scans are fast. |
+| **Build fails on EAS** | Run `npx expo-doctor` and `npx expo install --check` locally first (both must be clean), then read the EAS build logs at the build URL. |
+
+### Pushing an update
+
+1. Bump `android.versionCode` in [`frontend/app.json`](frontend/app.json) (e.g.
+   `1` → `2`). Optionally bump `version` (the human-readable name).
+2. Rebuild: `npm run build:preview`.
+3. Share the new APK link. Testers install it **over the top** of the old one —
+   app data (scan history, offline queue) is preserved because the package name
+   (`com.labify.app`) is unchanged.
+
+> The Android package name `com.labify.app` is **permanent** — changing it makes
+> Android treat it as a different app (fresh install, no data carryover). Don't
+> change it after the first release.
+
 ## How it works
 
 1. The camera continuously scans for barcodes/QR codes.

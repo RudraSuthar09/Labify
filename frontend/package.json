@@ -12,11 +12,14 @@
     "axios": "^1.18.1",
     "babel-preset-expo": "~54.0.10",
     "expo": "^54.0.35",
+    "expo-asset": "~12.0.13",
     "expo-audio": "~1.1.1",
     "expo-camera": "~17.0.10",
+    "expo-constants": "~18.0.13",
     "expo-file-system": "~19.0.23",
     "expo-haptics": "~15.0.8",
     "expo-image-manipulator": "~14.0.8",
+    "expo-splash-screen": "~31.0.13",
     "expo-status-bar": "~3.0.9",
     "react": "19.1.0",
     "react-dom": "19.1.0",
@@ -35,7 +38,9 @@
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "build:preview": "eas build --platform android --profile preview",
+    "build:production": "eas build --platform android --profile production"
   },
   "private": true
 }

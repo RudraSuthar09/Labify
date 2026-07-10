@@ -1,20 +1,28 @@
 {
   "expo": {
     "name": "Labify",
-    "slug": "Labify",
+    "slug": "labify",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.labelverify.app",
+      "bundleIdentifier": "com.labify.app",
       "infoPlist": {
-        "NSCameraUsageDescription": "LabelVerify uses the camera to scan barcodes on battery-pack labels."
+        "NSCameraUsageDescription": "Labify uses the camera to scan barcodes on battery-pack labels."
       }
     },
     "android": {
-      "package": "com.labelverify.app",
+      "package": "com.labify.app",
+      "versionCode": 1,
+      "permissions": [
+        "CAMERA",
+        "INTERNET",
+        "VIBRATE",
+        "android.permission.CAMERA",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
+      ],
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -30,10 +38,34 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "LabelVerify uses the camera to scan barcodes on battery-pack labels."
+          "cameraPermission": "Labify uses the camera to scan barcodes on battery-pack labels.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
         }
       ],
-      "expo-audio"
-    ]
+      [
+        "expo-audio",
+        {
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ],
+      "expo-asset",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#E6F4FE"
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "c99e4758-bbe5-4513-98a0-93f0e4a46cbe"
+      }
+    },
+    "owner": "rudrasuhani"
   }
 }
